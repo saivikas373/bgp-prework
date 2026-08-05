@@ -45,12 +45,23 @@ RESERVED_NETWORKS = [
 ]
 
 
+def _is_subnet_of(inner, outer):
+    """
+    inner.subnet_of(outer) equivalent, without relying on
+    ipaddress.subnet_of() (added in Python 3.7 - jump server runs 3.6).
+    """
+    if inner.version != outer.version:
+        return False
+    return (int(outer.network_address) <= int(inner.network_address)
+            and int(inner.broadcast_address) <= int(outer.broadcast_address))
+
+
 def _matching_aggregates(prefix_str, aggregates):
     try:
         net = ipaddress.ip_network(prefix_str, strict=False)
     except ValueError:
         return []
-    matches = [a for a in aggregates if a["net"].version == net.version and net.subnet_of(a["net"])]
+    matches = [a for a in aggregates if _is_subnet_of(net, a["net"])]
     matches.sort(key=lambda a: a["net"].prefixlen, reverse=True)
     return matches
 
@@ -77,7 +88,7 @@ def classify_ip(prefix_str, aggregates):
     except ValueError:
         return "unknown"
     for reserved, label in RESERVED_NETWORKS:
-        if reserved.version == net.version and net.subnet_of(reserved):
+        if _is_subnet_of(net, reserved):
             return label
     matches = _matching_aggregates(prefix_str, aggregates)
     if matches and matches[0].get("classification"):
