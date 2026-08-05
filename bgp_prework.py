@@ -154,6 +154,65 @@ def _parse_blocks(config_text, block_start_re):
     return blocks
 
 
+def parse_bgp_originations(config_text):
+    """
+    Extracts what this router actually originates/aggregates, straight from
+    the top-level (not per-neighbor) address-family blocks:
+
+        address-family ipv4 unicast
+         network 22.80.64.0/19 route-policy LOCAL_PREF_50_POLICY
+         network 24.27.242.36/31
+         aggregate-address 24.27.242.0/23
+         aggregate-address 66.56.248.0/22 summary-only
+
+    Returns a list of {cidr, kind, route_policy, summary_only} - this is the
+    candidate list for aggregates.csv. Classification (Public vs Private GUA)
+    still has to come from you/NOC - this only finds *what* is originated,
+    not whether it should be hidden from the internet.
+
+    Only matches inside a bare `address-family` block (i.e. not indented
+    under a `neighbor` or `neighbor-group` block) so per-neighbor policy
+    lines aren't mistaken for global originations.
+    """
+    originations = []
+    in_global_af = False
+    indent_stack = 0
+    for raw_line in config_text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+
+        if re.match(r"^\s*(neighbor|neighbor-group)\s+\S+\s*$", line):
+            in_global_af = False
+            continue
+        if re.match(r"^\s*address-family\s+\S+\s+\S+\s*$", line):
+            # only "global" if it's at the router bgp's own indent level (1),
+            # not nested deeper inside a neighbor/neighbor-group block
+            in_global_af = indent <= 1
+            continue
+        if not stripped or stripped == "!":
+            if indent <= 1:
+                in_global_af = False
+            continue
+        if not in_global_af:
+            continue
+
+        m = re.match(r"network\s+(\S+)(?:\s+route-policy\s+(\S+))?", stripped)
+        if m:
+            originations.append({
+                "cidr": m.group(1), "kind": "network",
+                "route_policy": m.group(2) or "", "summary_only": False,
+            })
+            continue
+        m = re.match(r"aggregate-address\s+(\S+)(\s+summary-only)?", stripped)
+        if m:
+            originations.append({
+                "cidr": m.group(1), "kind": "aggregate-address",
+                "route_policy": "", "summary_only": bool(m.group(2)),
+            })
+    return originations
+
+
 def parse_bgp_running_config(config_text):
     """
     Parses `show running-config router bgp` into {neighbor_ip: {...}}.
@@ -420,7 +479,55 @@ def main():
                          "`show bgp ... <prefix>` (one extra command per prefix - slow "
                          "on large tables). Without this flag, communities column falls "
                          "back to the static route-policy-level community list.")
+    ap.add_argument("--discover-aggregates", metavar="OUT_CSV", default=None,
+                    help="Instead of the full prework pull, just parse each device's "
+                         "running-config for `network`/`aggregate-address` statements "
+                         "and write a candidate aggregates CSV to OUT_CSV for you to "
+                         "review. Classification is left as TBD - that's your/NOC's "
+                         "call, not something derivable from the config.")
     args = ap.parse_args()
+
+    if args.discover_aggregates:
+        devices = load_devices(args.devices)
+        use_sample_dir = args.sample_dir is not None
+        username = password = None
+        if not use_sample_dir:
+            if ConnectHandler is None:
+                sys.exit("netmiko is not installed. Run: pip install -r requirements.txt")
+            username = os.environ.get("NETOPS_USERNAME") or input("Username: ")
+            password = os.environ.get("NETOPS_PASSWORD") or getpass.getpass("Password: ")
+
+        discovered = []
+        for dev in devices:
+            location, hostname = dev["location"], dev["hostname"]
+            print(f"[{location}] {hostname}: reading running-config...", file=sys.stderr)
+            if use_sample_dir:
+                running_bgp = (Path(args.sample_dir) / hostname / "running_bgp.txt").read_text()
+            else:
+                conn = ConnectHandler(
+                    device_type=dev.get("device_type", "cisco_xr"),
+                    host=dev["mgmt_ip"], username=username, password=password,
+                    port=int(dev.get("port") or 22),
+                )
+                running_bgp = conn.send_command("show running-config router bgp")
+                conn.disconnect()
+            for o in parse_bgp_originations(running_bgp):
+                discovered.append({
+                    "location": location, "aggregate_cidr": o["cidr"],
+                    "classification": "TBD",
+                    "description": f"{o['kind']}" + (" summary-only" if o["summary_only"] else "")
+                                   + (f" via {o['route_policy']}" if o["route_policy"] else "")
+                                   + f" (from {hostname} running-config)",
+                })
+
+        with open(args.discover_aggregates, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["location", "aggregate_cidr", "classification", "description"])
+            writer.writeheader()
+            writer.writerows(discovered)
+        print(f"Wrote {len(discovered)} candidate aggregate rows to {args.discover_aggregates}. "
+              f"Review/edit the 'classification' column (TBD -> Public or Private GUA) before using it.",
+              file=sys.stderr)
+        return
 
     aggregates = load_aggregates(args.aggregates)
     devices = load_devices(args.devices)
