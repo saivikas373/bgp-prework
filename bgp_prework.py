@@ -325,7 +325,11 @@ def parse_prefix_detail_communities(detail_text):
     group-best, multipath"). Falls back to the first path with a Community
     line if no path is explicitly marked best.
     """
-    blocks = re.split(r"(?=^Path #\d+:)", detail_text, flags=re.MULTILINE)
+    # re.split() on a zero-width lookahead needs Python 3.7+; the jump
+    # server runs 3.6, so slice on match start positions manually instead.
+    starts = [m.start() for m in re.finditer(r"^Path #\d+:", detail_text, flags=re.MULTILINE)]
+    blocks = [detail_text[start:(starts[i + 1] if i + 1 < len(starts) else len(detail_text))]
+              for i, start in enumerate(starts)]
     best_communities = None
     first_communities = None
     for block in blocks:
