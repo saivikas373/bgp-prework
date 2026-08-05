@@ -1,3 +1,5 @@
-netmiko>=4.3
-pandas>=2.0
-openpyxl>=3.1
+# Pinned for Python 3.6.8 (jump server default) - newer netmiko/pandas
+# require Python 3.8+/3.9+ and won't install here.
+netmiko==3.4.0
+pandas==1.1.5
+openpyxl==3.0.10
