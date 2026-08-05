@@ -1,0 +1,4 @@
+location,aggregate_cidr,classification,description
+LOC4,203.0.113.0/24,Public,LOC4 primary public block - freely advertised
+LOC4,192.0.2.0/24,Private GUA,LOC4 secondary block - NOC said do not advertise to internet
+LOC5,198.51.100.0/24,Public,LOC5 primary public block - freely advertised

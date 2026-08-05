@@ -1,0 +1,15 @@
+# Real device/aggregate data - never commit. Copy the .example files to
+# these names and fill in real values locally; git will ignore them.
+devices.csv
+aggregates.csv
+
+# Output workbooks - contain real network data once run for real
+*.xlsx
+
+# Captured device output used to validate the parser - may contain real data
+samples/
+
+# Python
+venv/
+__pycache__/
+*.pyc

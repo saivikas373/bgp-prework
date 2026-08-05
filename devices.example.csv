@@ -1,0 +1,3 @@
+location,hostname,mgmt_ip,device_type,port
+LOC4,pe1-loc4,10.0.0.1,cisco_xr,22
+LOC5,pe1-loc5,10.0.0.2,cisco_xr,22
