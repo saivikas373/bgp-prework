@@ -429,13 +429,21 @@ def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, use_sample_di
 
 
 def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
-               summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir, with_communities):
+               summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir, with_communities,
+               neighbor_group_filter=None):
     rows = []
     all_ips = [(ip, "ipv4") for ip in summary_v4_ips] + [(ip, "ipv6") for ip in summary_v6_ips]
 
     for ip, afi in all_ips:
         cfg = neighbor_cfg.get(ip, {})
-        print(f"  neighbor {ip} ({afi}, group={cfg.get('neighbor_group') or 'unknown'}):", file=sys.stderr)
+        group = cfg.get("neighbor_group") or ""
+
+        if neighbor_group_filter and group.upper() not in neighbor_group_filter:
+            print(f"  neighbor {ip} ({afi}, group={group or 'unknown'}): skipped, "
+                  f"not in --neighbor-groups filter", file=sys.stderr)
+            continue
+
+        print(f"  neighbor {ip} ({afi}, group={group or 'unknown'}):", file=sys.stderr)
         adv_text, rec_text = collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, use_sample_dir)
         adv_routes = parse_routes(adv_text)
         rec_routes = parse_routes(rec_text)
@@ -502,7 +510,17 @@ def main():
                          "and write a candidate aggregates CSV to OUT_CSV for you to "
                          "review. Classification is left as TBD - that's your/NOC's "
                          "call, not something derivable from the config.")
+    ap.add_argument("--neighbor-groups", default=None,
+                    help="Comma-separated neighbor-group names to include (case-insensitive), "
+                         "e.g. IPV4_CORE,IPV6_CORE. Neighbors on any other group (ELF, SPINE, "
+                         "etc.) are skipped entirely - useful when the prework is only about "
+                         "the groups you're actually renaming. Default: no filter, all neighbors.")
     args = ap.parse_args()
+
+    neighbor_group_filter = (
+        {g.strip().upper() for g in args.neighbor_groups.split(",")}
+        if args.neighbor_groups else None
+    )
 
     if args.discover_aggregates:
         devices = load_devices(args.devices)
@@ -582,7 +600,7 @@ def main():
 
         rows = build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
                           summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir,
-                          args.with_communities)
+                          args.with_communities, neighbor_group_filter)
         all_rows.extend(rows)
 
         if not use_sample_dir:
