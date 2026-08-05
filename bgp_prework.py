@@ -378,10 +378,19 @@ def collect_from_device(conn_or_dir, hostname, use_sample_dir=False):
             outputs[key] = fp.read_text() if fp.exists() else ""
     else:
         conn = conn_or_dir
-        outputs["summary_v4"] = conn.send_command("show bgp ipv4 unicast summary")
-        outputs["summary_v6"] = conn.send_command("show bgp ipv6 unicast summary")
-        outputs["running_bgp"] = conn.send_command("show running-config router bgp")
+        outputs["summary_v4"] = _run(conn, "show bgp ipv4 unicast summary")
+        outputs["summary_v6"] = _run(conn, "show bgp ipv6 unicast summary")
+        outputs["running_bgp"] = _run(conn, "show running-config router bgp")
     return outputs
+
+
+def _run(conn, cmd):
+    """Runs a show command on the device, echoing it to stderr first so you
+    can see exactly what's about to execute (and Ctrl+C before it if needed).
+    Every command this script ever sends is a read-only `show` - safe to
+    interrupt at any point, nothing is left half-configured."""
+    print(f"    $ {cmd}", file=sys.stderr)
+    return conn.send_command(cmd)
 
 
 def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, use_sample_dir=False):
@@ -393,9 +402,9 @@ def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, use_sample_dir=F
         rec = rec_file.read_text() if rec_file.exists() else ""
     else:
         conn = conn_or_dir
-        adv = conn.send_command(f"show bgp {afi} unicast neighbors {ip} advertised-routes")
+        adv = _run(conn, f"show bgp {afi} unicast neighbors {ip} advertised-routes")
         try:
-            rec = conn.send_command(f"show bgp {afi} unicast neighbors {ip} received-routes")
+            rec = _run(conn, f"show bgp {afi} unicast neighbors {ip} received-routes")
         except Exception:
             # needs `bgp neighbor soft-reconfiguration inbound` or route-refresh capability
             rec = ""
@@ -415,7 +424,7 @@ def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, use_sample_di
         text = fp.read_text() if fp.exists() else ""
     else:
         conn = conn_or_dir
-        text = conn.send_command(f"show bgp {afi} unicast {prefix}")
+        text = _run(conn, f"show bgp {afi} unicast {prefix}")
     return parse_prefix_detail_communities(text)
 
 
@@ -426,6 +435,7 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
 
     for ip, afi in all_ips:
         cfg = neighbor_cfg.get(ip, {})
+        print(f"  neighbor {ip} ({afi}, group={cfg.get('neighbor_group') or 'unknown'}):", file=sys.stderr)
         adv_text, rec_text = collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, use_sample_dir)
         adv_routes = parse_routes(adv_text)
         rec_routes = parse_routes(rec_text)
@@ -449,9 +459,16 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
                          "Agg": "", "IP Classification": "", "communities": ""})
             continue
 
-        for r in adv_routes:
-            communities = (collect_prefix_communities(conn_or_dir, hostname, r["prefix"], afi, use_sample_dir)
-                           if with_communities else static_comm_out)
+        if with_communities and adv_routes:
+            print(f"    {len(adv_routes)} advertised prefixes - pulling per-prefix community "
+                  f"for each (one command per prefix)...", file=sys.stderr)
+
+        for i, r in enumerate(adv_routes, 1):
+            if with_communities:
+                print(f"    [{i}/{len(adv_routes)}] {r['prefix']}", file=sys.stderr)
+                communities = collect_prefix_communities(conn_or_dir, hostname, r["prefix"], afi, use_sample_dir)
+            else:
+                communities = static_comm_out
             rows.append({**base_row, "direction": "advertised (out)", "prefix": r["prefix"],
                          "nexthop": r["next_hop"], "as_path": r["as_path"],
                          "Agg": find_aggregate(r["prefix"], aggregates),
@@ -509,7 +526,7 @@ def main():
                     host=dev["mgmt_ip"], username=username, password=password,
                     port=int(dev.get("port") or 22),
                 )
-                running_bgp = conn.send_command("show running-config router bgp")
+                running_bgp = _run(conn, "show running-config router bgp")
                 conn.disconnect()
             for o in parse_bgp_originations(running_bgp):
                 discovered.append({
@@ -587,4 +604,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Every command this script runs is a read-only `show` - aborting
+        # mid-run leaves nothing half-configured on any device, and no
+        # output file is written for a run you interrupted.
+        print("\nAborted (Ctrl+C) - no output written. Nothing was changed "
+              "on any device (only read-only `show` commands are ever sent).",
+              file=sys.stderr)
+        sys.exit(130)
