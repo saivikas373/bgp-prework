@@ -80,6 +80,24 @@ prefix — can be slow on a neighbor with hundreds of routes). Without it, the
 route-policy *can* set, not necessarily the one that applied to that specific
 prefix.
 
+Add `--neighbor-groups IPV4_CORE,IPV6_CORE` (comma-separated, case-insensitive,
+**no space after the comma** — the shell splits on it otherwise) to only
+process neighbors on those specific neighbor-groups, skipping everything else
+(ELF, SPINE, etc. entirely, not just filtering them out afterward). Use this
+when the prework is scoped to the groups you're actually renaming.
+
+Add `--discover-aggregates discovered.csv` to skip the full prework pull and
+just parse each device's running-config for `network`/`aggregate-address`
+statements, writing a candidate `aggregates.csv` for you to review — saves
+hand-transcribing CIDR blocks out of the config. The `classification` column
+comes back `TBD` for every row; fill in `Public`/`Private GUA` yourself, that
+part is NOC's call.
+
+Every command the script ever sends is a read-only `show` (never
+`configure terminal`, never `commit`) — safe to Ctrl+C at any point, nothing
+is left half-done on the device. The script prints each command right before
+it runs, so you can watch exactly what's happening live.
+
 ## Output columns
 
 `prework.xlsx`, sheet `bgp_prework` — one row per (neighbor, direction, prefix):
@@ -111,3 +129,53 @@ the groups.
 - Regex-based config/output parsing — validated against real ASR9K/IOS-XR
   6.6.2 output, but other releases/platforms may format slightly differently.
   Use the sample-dir workflow above to catch that before it matters.
+
+## Session notes: environment gotchas already hit and fixed
+
+This ran into a string of environment-specific problems on the actual
+Charter jump server (`chrcnctr-aps-naas-jmp-01`) — recording them here so the
+next session (possibly on a different machine, e.g. an office laptop) doesn't
+rediscover them from scratch:
+
+- **Access path**: jump server requires PID + password + a 30-second-expiry
+  Symantec VIP code, then a second plain-password SSH hop to the actual
+  device. This script is meant to run **from the jump server itself**, after
+  you've already authenticated there manually — it only automates the second
+  hop (jump server -> device), not the OTP step, and it shouldn't try to.
+- **Home directory disk quota**: hit "Disk quota exceeded" cloning into `~`
+  on one jump server instance. Fix was either cloning into `/tmp` instead, or
+  (as happened here) just being on a different jump server host that had
+  quota available. Check `quota -s` / try `/tmp` if `git clone` fails this
+  way.
+- **Python 3.6.8 + pip 9.0.3** on the jump server (EOL, 2018-era pip). This
+  forced several fixes, already applied in this repo:
+  - `requirements.txt` pinned to `netmiko==3.4.0`, `pandas==1.1.5`,
+    `openpyxl==3.0.10` (newer majors need Python 3.8/3.9+).
+  - `paramiko==2.11.0` + `bcrypt==3.2.2` pinned explicitly — netmiko's
+    unbounded `paramiko>=2.6.0` otherwise resolves to a paramiko needing a
+    bcrypt version that requires a Rust build toolchain, not available here.
+  - `pip install --upgrade pip` inside the venv first — pip 9 doesn't
+    understand modern wheel tags and falls back to building from source
+    (which then fails without a compiler), even when a wheel exists.
+  - Code had to avoid two Python 3.7+-only things: `re.split()` on a
+    zero-width lookahead pattern, and `ipaddress.IPv4Network.subnet_of()`.
+    Both fixed in the code itself (see `_is_subnet_of()` and the manual
+    `Path #N:` block-splitting in `parse_prefix_detail_communities()`), so
+    this shouldn't resurface — but worth knowing why those look the way they
+    do if you're reading the source.
+- **GitHub push auth**: password auth for git is disabled by GitHub; needed
+  `gh auth setup-git` to wire up the credential helper from an already
+  `gh auth login`-ed session.
+- **Repo visibility**: kept **public** deliberately, since the tracked files
+  never contain real device data (`devices.csv`/`aggregates.csv`/`samples/`/
+  `*.xlsx` are all gitignored) — this let the jump server `git clone` without
+  needing a personal access token sitting on a shared corporate machine. If
+  you ever add real data to a tracked file, stop and reconsider this.
+- **Getting the output file off the jump server**: unresolved as of the last
+  session — a `scp` attempt hit `Not a directory` on the destination path.
+  Likely `~/Downloads` doesn't exist on one end. Next attempt: `scp
+  prework.xlsx <user>@<host>:~/` (home dir, not a subfolder) from whichever
+  side actually has reachability, or check exactly which command was run.
+- **Shell quoting**: `--neighbor-groups IPV4_CORE, IPV6_CORE` (space after
+  comma) gets split into two shell arguments and argparse rejects the second
+  one as unrecognized. No space after the comma.
