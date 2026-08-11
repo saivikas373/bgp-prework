@@ -655,13 +655,18 @@ def collect_from_device(conn_or_dir, hostname, platform="iosxr", use_sample_dir=
     return outputs
 
 
-def _run(conn, cmd):
+def _run(conn, cmd, delay_factor=1):
     """Runs a show command on the device, echoing it to stderr first so you
     can see exactly what's about to execute (and Ctrl+C before it if needed).
     Every command this script ever sends is a read-only `show` - safe to
-    interrupt at any point, nothing is left half-configured."""
+    interrupt at any point, nothing is left half-configured.
+
+    delay_factor scales netmiko's read timeout for slow commands (e.g. a
+    full route-table dump on a large peer) - default 1 is netmiko's normal
+    ~10s-ish budget, bump it for advertised/received-routes pulls since
+    those are the commands most likely to be slow on a busy neighbor."""
     print(f"    $ {cmd}", file=sys.stderr)
-    return conn.send_command(cmd)
+    return conn.send_command(cmd, delay_factor=delay_factor)
 
 
 def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform="iosxr", use_sample_dir=False):
@@ -675,8 +680,20 @@ def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform="iosxr"
         conn = conn_or_dir
         if platform == "junos":
             table_suffix = " table inet6.0" if afi == "ipv6" else ""
-            adv = _run(conn, f"show route advertising-protocol bgp {ip}{table_suffix}")
-            rec = _run(conn, f"show route receive-protocol bgp {ip}{table_suffix}")
+            try:
+                adv = _run(conn, f"show route advertising-protocol bgp {ip}{table_suffix}", delay_factor=8)
+            except Exception as e:
+                print(f"    ! advertised-routes pull for {ip} failed/timed out ({e}) - "
+                      f"treating as empty and continuing. Likely a large table on this peer; "
+                      f"re-run scoped to just this neighbor-group if it keeps happening.",
+                      file=sys.stderr)
+                adv = ""
+            try:
+                rec = _run(conn, f"show route receive-protocol bgp {ip}{table_suffix}", delay_factor=8)
+            except Exception as e:
+                print(f"    ! received-routes pull for {ip} failed/timed out ({e}) - "
+                      f"treating as empty and continuing.", file=sys.stderr)
+                rec = ""
         else:
             adv = _run(conn, f"show bgp {afi} unicast neighbors {ip} advertised-routes")
             try:
