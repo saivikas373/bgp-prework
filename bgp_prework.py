@@ -4,7 +4,8 @@ BGP prework data collector.
 
 Pulls per-neighbor BGP state (neighbor-group, remote-AS, advertised/received
 prefixes, communities, aggregate match, public/private) from Cisco IOS-XR/IOS-XE
-routers and writes it to an Excel workbook. Built for the prework before
+routers, or from Junos neighbors (device_type containing "juniper"/"junos" in
+devices.csv), and writes it to an Excel workbook. Built for the prework before
 standardizing neighbor-group naming on the remaining 2 locations, so you can
 diff "what was advertised before" vs "after" and confirm the NOC team's
 route manipulation still works post-rename.
@@ -115,6 +116,14 @@ def load_aggregates(path):
 def load_devices(path):
     with open(path, newline="") as f:
         return list(csv.DictReader(f))
+
+
+def device_platform(dev):
+    """netmiko device_type -> which parser family to use ('junos' or 'iosxr')."""
+    dt = (dev.get("device_type") or "").lower()
+    if "juniper" in dt or "junos" in dt:
+        return "junos"
+    return "iosxr"
 
 
 # ---------------------------------------------------------------------------
@@ -379,23 +388,270 @@ def parse_bgp_summary(show_summary_text):
 
 
 # ---------------------------------------------------------------------------
+# Junos output parsing
+# NOTE: written from Junos config/show-output conventions, not yet validated
+# against real captured output from a live Junos box (the IOS-XR parsers
+# above went through exactly this and needed fixing once real output didn't
+# match what was assumed - same risk applies here). Run with --sample-dir
+# against captured real `show`/`show configuration` output before trusting
+# this against live neighbors.
+# ---------------------------------------------------------------------------
+
+def parse_junos_bgp_summary(show_summary_text):
+    """
+    Parses `show bgp summary` -> (v4_ips, v6_ips).
+
+    Junos mixes both address families in one table (unlike XR's separate
+    `summary`/`summary` per AFI commands), e.g.:
+
+        Groups: 2 Peers: 4 Down peers: 0
+        Table          Tot Paths  Act Paths Suppressed    History Damp State    Pending
+        inet.0                57         57          0          0          0          0
+        Peer                     AS      InPkt     OutPkt    OutQ   Flaps Last Up/Dwn State|...
+        24.93.64.1            11426      12345      12340       0       0     3w2d6h Establ
+          inet.0: 57/57/57/0
+        2606:a000:0:4::74     11426        123        120       0       0     3w2d6h Establ
+          inet6.0: 1/1/1/0
+
+    So instead of an XR-style header gate, every line's first token is
+    tried as an IP address and split into v4/v6 by version.
+    """
+    v4_ips, v6_ips = [], []
+    for line in show_summary_text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        try:
+            ip = ipaddress.ip_address(parts[0])
+        except ValueError:
+            continue
+        (v4_ips if ip.version == 4 else v6_ips).append(parts[0])
+    return v4_ips, v6_ips
+
+
+JUNOS_ROUTE_LINE_RE = re.compile(
+    r"^\*?\s*(?P<prefix>\d+\.\d+\.\d+\.\d+/\d+|[0-9a-fA-F:]+/\d+)\s+(?P<nexthop>\S+)\s+(?P<rest>.+?)\s*$"
+)
+
+
+def parse_junos_routes(show_routes_text):
+    """
+    Parses `show route advertising-protocol bgp <ip>` / `show route
+    receive-protocol bgp <ip>` output -> [{prefix, next_hop, as_path}].
+
+    Typical Junos format:
+        inet.0: 25 destinations, 25 routes (25 active, 0 holddown, 0 hidden)
+          Prefix		  Nexthop	      MED     Lclpref    AS path
+        * 10.1.194.0/23      Self                                    19115 11426 I
+        * 22.80.64.0/19      24.93.64.1                               19115 11426 I
+
+    Leading `*` marks the active route; nexthop is "Self" on advertised
+    routes toward the peer. MED/Lclpref may or may not be present, so -
+    like the XR parser - everything after prefix+nexthop is kept together
+    as the as_path field rather than guessing fixed column widths.
+    """
+    routes = []
+    for line in show_routes_text.splitlines():
+        m = JUNOS_ROUTE_LINE_RE.match(line)
+        if not m:
+            continue
+        as_path = m.group("rest").strip()
+        routes.append({"prefix": m.group("prefix"), "next_hop": m.group("nexthop"), "as_path": as_path})
+    return routes
+
+
+def parse_junos_bgp_config(config_text):
+    """
+    Parses `show configuration protocols bgp` (Junos curly-brace format)
+    into {neighbor_ip: {neighbor_group, remote_as, description, policy_in,
+    policy_out}}.
+
+    Junos nests neighbors directly inside their group block (unlike XR's
+    `use neighbor-group` reference), and a neighbor sub-block overrides
+    whatever it repeats from the group:
+
+        group IPV4-CORE {
+            type external;
+            description "CHRCNCTR01R";
+            peer-as 11426;
+            import IPV4-CORE-PEER-IN;
+            export IPV4-CORE-PEER-OUT;
+            neighbor 24.93.64.1;
+            neighbor 24.93.64.2 {
+                description "override";
+            }
+        }
+
+    Walks brace depth generically (any "... {" pushes a context inherited
+    from its parent, any "}" pops it) so unrelated nested stanzas (family,
+    bfd-liveness-detection, etc.) are skipped harmlessly rather than
+    breaking the group/neighbor tracking.
+    """
+    base_fields = {"neighbor_group": "", "remote_as": "", "description": "", "policy_in": "", "policy_out": ""}
+    stack = [dict(base_fields)]
+    tag_stack = [None]
+    neighbors = {}
+
+    for raw_line in config_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        m = re.match(r"^neighbor\s+(\S+)\s*;$", line)
+        if m:
+            neighbors[m.group(1)] = dict(stack[-1])
+            continue
+
+        m = re.match(r"^group\s+(\S+)\s*\{$", line)
+        if m:
+            fields = dict(stack[-1])
+            fields["neighbor_group"] = m.group(1)
+            stack.append(fields)
+            tag_stack.append(None)
+            continue
+
+        m = re.match(r"^neighbor\s+(\S+)\s*\{$", line)
+        if m:
+            stack.append(dict(stack[-1]))
+            tag_stack.append(("neighbor", m.group(1)))
+            continue
+
+        if line.endswith("{"):
+            stack.append(dict(stack[-1]))
+            tag_stack.append(None)
+            continue
+
+        if line == "}":
+            fields = stack.pop() if len(stack) > 1 else stack[-1]
+            tag = tag_stack.pop() if len(tag_stack) > 1 else None
+            if tag and tag[0] == "neighbor":
+                neighbors[tag[1]] = fields
+            continue
+
+        m = re.match(r'^description\s+"([^"]*)"\s*;$', line) or re.match(r"^description\s+(\S+)\s*;$", line)
+        if m:
+            stack[-1]["description"] = m.group(1).strip()
+            continue
+        m = re.match(r"^peer-as\s+(\S+)\s*;$", line)
+        if m:
+            stack[-1]["remote_as"] = m.group(1)
+            continue
+        m = re.match(r"^import\s+(\S+)\s*;$", line)
+        if m:
+            stack[-1]["policy_in"] = m.group(1)
+            continue
+        m = re.match(r"^export\s+(\S+)\s*;$", line)
+        if m:
+            stack[-1]["policy_out"] = m.group(1)
+            continue
+
+    return neighbors
+
+
+def parse_junos_policy_communities(policy_options_text):
+    """
+    Static fallback: resolves `then community add NAME;` inside
+    `policy-options policy-statement ...` blocks against `policy-options
+    community NAME members [ ... ];` definitions. Equivalent in spirit to
+    the XR `route-policy ... set community (...)` static parser.
+
+    Expects `show configuration policy-options` text. Same caveat as the
+    XR version: a static read of the policy, not per-prefix - if a policy
+    sets different communities per term, all are attributed to every
+    neighbor using this policy. Brace depth is tracked with a running
+    counter (rather than a full stack) since only "am I still inside this
+    policy-statement" matters here.
+    """
+    community_defs = {}
+    for line in policy_options_text.splitlines():
+        m = re.match(r"^\s*community\s+(\S+)\s+members\s+\[([^\]]+)\]\s*;", line)
+        if m:
+            community_defs[m.group(1)] = m.group(2).split()
+            continue
+        m = re.match(r"^\s*community\s+(\S+)\s+members\s+(\S+)\s*;", line)
+        if m:
+            community_defs.setdefault(m.group(1), [m.group(2)])
+
+    policies = {}
+    current_policy = None
+    depth = 0
+    depth_at_policy_start = 0
+    for raw_line in policy_options_text.splitlines():
+        line = raw_line.strip()
+        m = re.match(r"^policy-statement\s+(\S+)\s*\{$", line)
+        if m and current_policy is None:
+            current_policy = m.group(1)
+            policies.setdefault(current_policy, [])
+            depth_at_policy_start = depth
+        if current_policy:
+            cm = re.search(r"community\s+add\s+(\S+)\s*;", line)
+            if cm:
+                policies[current_policy].extend(community_defs.get(cm.group(1), []))
+        depth += line.count("{") - line.count("}")
+        if current_policy is not None and depth <= depth_at_policy_start:
+            current_policy = None
+    return policies
+
+
+def parse_junos_prefix_communities(detail_text):
+    """
+    Parses `show route <prefix> extensive` -> best-path community string,
+    semicolon-joined to match the sheet's existing format (same shape as
+    parse_prefix_detail_communities for XR).
+
+    Junos marks the active path's protocol line with a leading `*`
+    (e.g. "*BGP    Preference: 170/-101") and lists communities as:
+        Communities: 20115:3101 20115:64080
+    Falls back to the first path with a Communities line if none is
+    explicitly marked active.
+    """
+    best_communities = None
+    first_communities = None
+    current_is_best = False
+    for line in detail_text.splitlines():
+        if re.match(r"^\s*\*?(BGP|Local|Static|OSPF|IS-IS)\b", line):
+            current_is_best = line.strip().startswith("*")
+        m = re.search(r"Communities:\s*(.+)$", line)
+        if m:
+            communities = m.group(1).strip()
+            if first_communities is None:
+                first_communities = communities
+            if current_is_best:
+                best_communities = communities
+    chosen = best_communities if best_communities is not None else (first_communities or "")
+    return chosen.replace(" ", ";")
+
+
+# ---------------------------------------------------------------------------
 # Data collection
 # ---------------------------------------------------------------------------
 
-def collect_from_device(conn_or_dir, hostname, use_sample_dir=False):
+def collect_from_device(conn_or_dir, hostname, platform="iosxr", use_sample_dir=False):
     outputs = {}
+    if platform == "junos":
+        files = [("summary", "summary.txt"),
+                 ("config_bgp", "config_bgp.txt"),
+                 ("policy_options", "policy_options.txt")]
+    else:
+        files = [("summary_v4", "summary_v4.txt"),
+                 ("summary_v6", "summary_v6.txt"),
+                 ("running_bgp", "running_bgp.txt")]
+
     if use_sample_dir:
         base = Path(conn_or_dir) / hostname
-        for key, fname in [("summary_v4", "summary_v4.txt"),
-                            ("summary_v6", "summary_v6.txt"),
-                            ("running_bgp", "running_bgp.txt")]:
+        for key, fname in files:
             fp = base / fname
             outputs[key] = fp.read_text() if fp.exists() else ""
     else:
         conn = conn_or_dir
-        outputs["summary_v4"] = _run(conn, "show bgp ipv4 unicast summary")
-        outputs["summary_v6"] = _run(conn, "show bgp ipv6 unicast summary")
-        outputs["running_bgp"] = _run(conn, "show running-config router bgp")
+        if platform == "junos":
+            outputs["summary"] = _run(conn, "show bgp summary")
+            outputs["config_bgp"] = _run(conn, "show configuration protocols bgp")
+            outputs["policy_options"] = _run(conn, "show configuration policy-options")
+        else:
+            outputs["summary_v4"] = _run(conn, "show bgp ipv4 unicast summary")
+            outputs["summary_v6"] = _run(conn, "show bgp ipv6 unicast summary")
+            outputs["running_bgp"] = _run(conn, "show running-config router bgp")
     return outputs
 
 
@@ -408,7 +664,7 @@ def _run(conn, cmd):
     return conn.send_command(cmd)
 
 
-def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, use_sample_dir=False):
+def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform="iosxr", use_sample_dir=False):
     if use_sample_dir:
         base = Path(conn_or_dir) / hostname
         adv_file = base / f"advertised_{ip.replace(':', '_')}.txt"
@@ -417,20 +673,25 @@ def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, use_sample_dir=F
         rec = rec_file.read_text() if rec_file.exists() else ""
     else:
         conn = conn_or_dir
-        adv = _run(conn, f"show bgp {afi} unicast neighbors {ip} advertised-routes")
-        try:
-            rec = _run(conn, f"show bgp {afi} unicast neighbors {ip} received-routes")
-        except Exception:
-            # needs `bgp neighbor soft-reconfiguration inbound` or route-refresh capability
-            rec = ""
+        if platform == "junos":
+            table_suffix = " table inet6.0" if afi == "ipv6" else ""
+            adv = _run(conn, f"show route advertising-protocol bgp {ip}{table_suffix}")
+            rec = _run(conn, f"show route receive-protocol bgp {ip}{table_suffix}")
+        else:
+            adv = _run(conn, f"show bgp {afi} unicast neighbors {ip} advertised-routes")
+            try:
+                rec = _run(conn, f"show bgp {afi} unicast neighbors {ip} received-routes")
+            except Exception:
+                # needs `bgp neighbor soft-reconfiguration inbound` or route-refresh capability
+                rec = ""
     return adv, rec
 
 
-def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, use_sample_dir=False):
+def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, platform="iosxr", use_sample_dir=False):
     """
-    Per-prefix community lookup via `show bgp <afi> unicast <prefix>`. Only
-    called when --with-communities is set, since it's one extra command per
-    prefix (can be hundreds across a full neighbor table - slow but exact).
+    Per-prefix community lookup. Only called when --with-communities is
+    set, since it's one extra command per prefix (can be hundreds across a
+    full neighbor table - slow but exact).
     """
     if use_sample_dir:
         base = Path(conn_or_dir) / hostname
@@ -439,15 +700,20 @@ def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, use_sample_di
         text = fp.read_text() if fp.exists() else ""
     else:
         conn = conn_or_dir
-        text = _run(conn, f"show bgp {afi} unicast {prefix}")
-    return parse_prefix_detail_communities(text)
+        if platform == "junos":
+            text = _run(conn, f"show route {prefix} extensive")
+        else:
+            text = _run(conn, f"show bgp {afi} unicast {prefix}")
+    parser = parse_junos_prefix_communities if platform == "junos" else parse_prefix_detail_communities
+    return parser(text)
 
 
 def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
                summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir, with_communities,
-               neighbor_group_filter=None):
+               neighbor_group_filter=None, platform="iosxr"):
     rows = []
     all_ips = [(ip, "ipv4") for ip in summary_v4_ips] + [(ip, "ipv6") for ip in summary_v6_ips]
+    route_parser = parse_junos_routes if platform == "junos" else parse_routes
 
     for ip, afi in all_ips:
         cfg = neighbor_cfg.get(ip, {})
@@ -459,9 +725,9 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
             continue
 
         print(f"  neighbor {ip} ({afi}, group={group or 'unknown'}):", file=sys.stderr)
-        adv_text, rec_text = collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, use_sample_dir)
-        adv_routes = parse_routes(adv_text)
-        rec_routes = parse_routes(rec_text)
+        adv_text, rec_text = collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform, use_sample_dir)
+        adv_routes = route_parser(adv_text)
+        rec_routes = route_parser(rec_text)
 
         # Static fallback: communities as configured in the route-policy text.
         # Overridden per-prefix below when --with-communities pulls the exact
@@ -489,7 +755,7 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
         for i, r in enumerate(adv_routes, 1):
             if with_communities:
                 print(f"    [{i}/{len(adv_routes)}] {r['prefix']}", file=sys.stderr)
-                communities = collect_prefix_communities(conn_or_dir, hostname, r["prefix"], afi, use_sample_dir)
+                communities = collect_prefix_communities(conn_or_dir, hostname, r["prefix"], afi, platform, use_sample_dir)
             else:
                 communities = static_comm_out
             rows.append({**base_row, "direction": "advertised (out)", "prefix": r["prefix"],
@@ -550,6 +816,13 @@ def main():
         discovered = []
         for dev in devices:
             location, hostname = dev["location"], dev["hostname"]
+            platform = device_platform(dev)
+            if platform == "junos":
+                print(f"[{location}] {hostname}: --discover-aggregates only supports IOS-XR "
+                      f"`network`/`aggregate-address` parsing today - skipping Junos device "
+                      f"(would need `show configuration policy-options` + routing-options "
+                      f"parsing). Fill its aggregates.csv rows in by hand.", file=sys.stderr)
+                continue
             print(f"[{location}] {hostname}: reading running-config...", file=sys.stderr)
             if use_sample_dir:
                 running_bgp = (Path(args.sample_dir) / hostname / "running_bgp.txt").read_text()
@@ -594,11 +867,12 @@ def main():
 
     for dev in devices:
         location, hostname = dev["location"], dev["hostname"]
-        print(f"[{location}] {hostname}: collecting...", file=sys.stderr)
+        platform = device_platform(dev)
+        print(f"[{location}] {hostname}: collecting ({platform})...", file=sys.stderr)
 
         if use_sample_dir:
             conn_or_dir = args.sample_dir
-            outputs = collect_from_device(conn_or_dir, hostname, use_sample_dir=True)
+            outputs = collect_from_device(conn_or_dir, hostname, platform, use_sample_dir=True)
         else:
             conn = ConnectHandler(
                 device_type=dev.get("device_type", "cisco_xr"),
@@ -606,16 +880,21 @@ def main():
                 port=int(dev.get("port") or 22),
             )
             conn_or_dir = conn
-            outputs = collect_from_device(conn, hostname, use_sample_dir=False)
+            outputs = collect_from_device(conn, hostname, platform, use_sample_dir=False)
 
-        neighbor_cfg = parse_bgp_running_config(outputs["running_bgp"])
-        communities_by_policy = parse_route_policy_communities(outputs["running_bgp"])
-        summary_v4_ips = parse_bgp_summary(outputs["summary_v4"])
-        summary_v6_ips = parse_bgp_summary(outputs["summary_v6"])
+        if platform == "junos":
+            neighbor_cfg = parse_junos_bgp_config(outputs["config_bgp"])
+            communities_by_policy = parse_junos_policy_communities(outputs["policy_options"])
+            summary_v4_ips, summary_v6_ips = parse_junos_bgp_summary(outputs["summary"])
+        else:
+            neighbor_cfg = parse_bgp_running_config(outputs["running_bgp"])
+            communities_by_policy = parse_route_policy_communities(outputs["running_bgp"])
+            summary_v4_ips = parse_bgp_summary(outputs["summary_v4"])
+            summary_v6_ips = parse_bgp_summary(outputs["summary_v6"])
 
         rows = build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
                           summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir,
-                          args.with_communities, neighbor_group_filter)
+                          args.with_communities, neighbor_group_filter, platform)
         all_rows.extend(rows)
 
         if not use_sample_dir:
