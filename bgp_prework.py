@@ -881,41 +881,51 @@ def main():
         password = os.environ.get("NETOPS_PASSWORD") or getpass.getpass("Password: ")
 
     all_rows = []
+    failed_devices = []
 
     for dev in devices:
         location, hostname = dev["location"], dev["hostname"]
         platform = device_platform(dev)
         print(f"[{location}] {hostname}: collecting ({platform})...", file=sys.stderr)
 
-        if use_sample_dir:
-            conn_or_dir = args.sample_dir
-            outputs = collect_from_device(conn_or_dir, hostname, platform, use_sample_dir=True)
-        else:
-            conn = ConnectHandler(
-                device_type=dev.get("device_type", "cisco_xr"),
-                host=dev["mgmt_ip"], username=username, password=password,
-                port=int(dev.get("port") or 22),
-            )
-            conn_or_dir = conn
-            outputs = collect_from_device(conn, hostname, platform, use_sample_dir=False)
+        conn_or_dir = None
+        try:
+            if use_sample_dir:
+                conn_or_dir = args.sample_dir
+                outputs = collect_from_device(conn_or_dir, hostname, platform, use_sample_dir=True)
+            else:
+                conn_or_dir = ConnectHandler(
+                    device_type=dev.get("device_type", "cisco_xr"),
+                    host=dev["mgmt_ip"], username=username, password=password,
+                    port=int(dev.get("port") or 22),
+                    conn_timeout=20, banner_timeout=20, auth_timeout=20, timeout=20,
+                )
+                outputs = collect_from_device(conn_or_dir, hostname, platform, use_sample_dir=False)
 
-        if platform == "junos":
-            neighbor_cfg = parse_junos_bgp_config(outputs["config_bgp"])
-            communities_by_policy = parse_junos_policy_communities(outputs["policy_options"])
-            summary_v4_ips, summary_v6_ips = parse_junos_bgp_summary(outputs["summary"])
-        else:
-            neighbor_cfg = parse_bgp_running_config(outputs["running_bgp"])
-            communities_by_policy = parse_route_policy_communities(outputs["running_bgp"])
-            summary_v4_ips = parse_bgp_summary(outputs["summary_v4"])
-            summary_v6_ips = parse_bgp_summary(outputs["summary_v6"])
+            if platform == "junos":
+                neighbor_cfg = parse_junos_bgp_config(outputs["config_bgp"])
+                communities_by_policy = parse_junos_policy_communities(outputs["policy_options"])
+                summary_v4_ips, summary_v6_ips = parse_junos_bgp_summary(outputs["summary"])
+            else:
+                neighbor_cfg = parse_bgp_running_config(outputs["running_bgp"])
+                communities_by_policy = parse_route_policy_communities(outputs["running_bgp"])
+                summary_v4_ips = parse_bgp_summary(outputs["summary_v4"])
+                summary_v6_ips = parse_bgp_summary(outputs["summary_v6"])
 
-        rows = build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
-                          summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir,
-                          args.with_communities, neighbor_group_filter, platform)
-        all_rows.extend(rows)
-
-        if not use_sample_dir:
-            conn_or_dir.disconnect()
+            rows = build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
+                              summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir,
+                              args.with_communities, neighbor_group_filter, platform)
+            all_rows.extend(rows)
+        except Exception as e:
+            print(f"[{location}] {hostname}: FAILED ({e}) - skipping this device, keeping "
+                  f"rows already collected from earlier devices.", file=sys.stderr)
+            failed_devices.append(hostname)
+        finally:
+            if conn_or_dir is not None and not use_sample_dir:
+                try:
+                    conn_or_dir.disconnect()
+                except Exception:
+                    pass
 
     df = pd.DataFrame(all_rows, columns=[
         "location", "hostname", "neighbor", "prefix", "nexthop", "as_path", "communities",
@@ -930,6 +940,9 @@ def main():
             grp.to_excel(writer, sheet_name="neighbor_group_summary", index=False)
 
     print(f"Wrote {len(df)} rows to {args.out}", file=sys.stderr)
+    if failed_devices:
+        print(f"WARNING: {len(failed_devices)} device(s) failed and were skipped "
+              f"(no rows collected from them): {', '.join(failed_devices)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
