@@ -59,8 +59,12 @@ def main():
     ap.add_argument("--out", default="reconciliation.xlsx", help="Output Excel path")
     args = ap.parse_args()
 
-    pre = pd.read_excel(args.pre)
-    rcr = pd.read_excel(args.rcr)
+    # Explicit engine: pandas==1.1.5 (pinned for Python 3.6) defaults to the
+    # xlrd engine for .xlsx, which isn't installed - and even installed,
+    # modern xlrd dropped .xlsx support entirely. openpyxl (already a
+    # dependency) reads .xlsx fine.
+    pre = pd.read_excel(args.pre, engine="openpyxl")
+    rcr = pd.read_excel(args.rcr, engine="openpyxl")
     pairs = load_pairs(args.pairs)
 
     detail_rows = []
