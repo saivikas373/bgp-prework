@@ -9,12 +9,20 @@ team's route manipulation still works once the rename lands.
 Validated against real ASR9K/IOS-XR output (running-config, `summary`,
 `advertised-routes`, and per-prefix `show bgp ... <prefix>` detail) — parser
 format assumptions were corrected against actual command output rather than
-guessed.
+guessed. Also supports Junos for the *received*-side check only (see
+"Multi-vendor support" below) — validated against real
+`show route receive-protocol bgp <neighbor-ip>` output.
 
 ## Files
 
-- `devices.csv` — fill in the 2 remaining locations: hostname, mgmt IP,
-  `device_type` (netmiko value — `cisco_xr` or `cisco_xe`), SSH port.
+- `devices.csv` — fill in the locations: hostname, mgmt IP, `device_type`
+  (netmiko value — `cisco_xr`, `cisco_xe`, or `juniper_junos`), SSH port.
+  Two optional columns, `neighbor_ip` and `afi` (default `ipv4`): if set,
+  the script checks *only* that one neighbor instead of discovering every
+  neighbor on the device. **Required for Junos rows** — full-device
+  discovery (`show bgp summary` / `show configuration protocols bgp`
+  equivalents) isn't supported for Junos yet, only checking one already-known
+  neighbor is.
 - `aggregates.csv` — fill in the CIDR block(s) your team owns per location,
   plus a `classification` per block: `Public` (freely advertised) or
   `Private GUA` (real public-IP space you own but the NOC team wants kept off
@@ -116,6 +124,30 @@ it runs, so you can watch exactly what's happening live.
 A second sheet, `neighbor_group_summary`, gives route counts per
 neighbor-group/neighbor — a quick before/after sanity check once you rename
 the groups.
+
+## Multi-vendor support
+
+The script was originally IOS-XR-only. Junos support was added for a
+specific use case: checking what an *upstream* device actually receives from
+an ELF-side neighbor, as a cross-check against what the ELF side shows itself
+advertising.
+
+- **Supported**: `show route receive-protocol bgp <neighbor-ip>` (the
+  "received" side), via `device_type=juniper_junos` in `devices.csv` with a
+  `neighbor_ip` set. Prefix/next-hop/AS-path all parse correctly, verified
+  against real `rcr01chrcnctr-re0` output.
+- **Not supported yet**: Junos advertised-routes (`show route
+  advertising-protocol bgp ...`), Junos running-config parsing (`show
+  configuration protocols bgp` — needed for neighbor-group-equivalent/
+  remote-AS/policy columns), and Junos `show bgp summary` (needed for
+  full-device neighbor discovery, which is why `neighbor_ip` is required for
+  Junos rows right now). None of these were guessed at — they're just not
+  built because no real sample output has been seen yet. Paste real output
+  for any of these and they can be added the same way the received-side
+  parser was.
+- On a Junos row, `neighbor_group`/`remote_as`/`description`/`policy_out`/
+  `policy_in`/`communities` all come back blank — that config-derived context
+  only exists for IOS-XR rows currently.
 
 ## Known limitations
 

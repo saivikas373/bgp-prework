@@ -1,3 +1,4 @@
-location,hostname,mgmt_ip,device_type,port
-LOC4,pe1-loc4,10.0.0.1,cisco_xr,22
-LOC5,pe1-loc5,10.0.0.2,cisco_xr,22
+location,hostname,mgmt_ip,device_type,port,neighbor_ip,afi
+LOC4,pe1-loc4,10.0.0.1,cisco_xr,22,,
+LOC5,pe1-loc5,10.0.0.2,cisco_xr,22,,
+LOC-UPSTREAM,rcr-example,10.0.0.3,juniper_junos,22,10.0.0.4,ipv4

@@ -357,6 +357,42 @@ def parse_prefix_detail_communities(detail_text):
     return chosen.replace(" ", ";")
 
 
+JUNOS_ROUTE_LINE_RE = re.compile(
+    r"^\s*\*?\s*(?P<prefix>\d+\.\d+\.\d+\.\d+/\d+|[0-9a-fA-F:]+/\d+)\s+(?P<nexthop>\S+)\s*(?P<rest>.*?)\s*$"
+)
+
+
+def parse_junos_receive_protocol(text):
+    """
+    Parses Junos `show route receive-protocol bgp <neighbor-ip>` output ->
+    [{prefix, next_hop, as_path}]. Real format:
+
+        Prefix                  Nexthop              MED     Lclpref    AS path
+        * 10.1.194.0/23           24.93.64.1                              19115 ?
+        * 22.80.64.0/19           24.93.64.1           0                  19115 I
+
+    MED/Lclpref are frequently blank (not zero-padded), so column position
+    isn't reliable - instead, take everything after the next-hop and treat
+    the trailing "<asn> <origin-code>" (or just "<asn>" with no origin code
+    on some lines) as the AS path, matching your example sheet's "19115 ?"
+    format (space-separated, unlike IOS-XR's concatenated "19115i").
+    """
+    routes = []
+    for line in text.splitlines():
+        m = JUNOS_ROUTE_LINE_RE.match(line)
+        if not m:
+            continue
+        rest_tokens = m.group("rest").split()
+        if len(rest_tokens) >= 2 and rest_tokens[-1] in ("I", "E", "?", "i", "e"):
+            as_path = " ".join(rest_tokens[-2:])
+        elif rest_tokens:
+            as_path = rest_tokens[-1]
+        else:
+            as_path = ""
+        routes.append({"prefix": m.group("prefix"), "next_hop": m.group("nexthop"), "as_path": as_path})
+    return routes
+
+
 def parse_bgp_summary(show_summary_text):
     """Parses `show bgp ipv4/ipv6 unicast summary` -> list of neighbor IPs."""
     ips = []
@@ -408,13 +444,21 @@ def _run(conn, cmd):
     return conn.send_command(cmd)
 
 
-def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, use_sample_dir=False):
+def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, device_type, use_sample_dir=False):
+    is_junos = device_type.startswith("juniper")
     if use_sample_dir:
         base = Path(conn_or_dir) / hostname
         adv_file = base / f"advertised_{ip.replace(':', '_')}.txt"
         rec_file = base / f"received_{ip.replace(':', '_')}.txt"
         adv = adv_file.read_text() if adv_file.exists() else ""
         rec = rec_file.read_text() if rec_file.exists() else ""
+    elif is_junos:
+        conn = conn_or_dir
+        # Junos "advertised-protocol" side not yet validated against real
+        # output - only `receive-protocol` (received side) is supported so
+        # far. Extend this once real advertised-side output is available.
+        adv = ""
+        rec = _run(conn, f"show route receive-protocol bgp {ip}")
     else:
         conn = conn_or_dir
         adv = _run(conn, f"show bgp {afi} unicast neighbors {ip} advertised-routes")
@@ -445,9 +489,11 @@ def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, use_sample_di
 
 def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
                summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir, with_communities,
-               neighbor_group_filter=None):
+               neighbor_group_filter=None, device_type="cisco_xr"):
     rows = []
     all_ips = [(ip, "ipv4") for ip in summary_v4_ips] + [(ip, "ipv6") for ip in summary_v6_ips]
+    is_junos = device_type.startswith("juniper")
+    route_parser = parse_junos_receive_protocol if is_junos else parse_routes
 
     for ip, afi in all_ips:
         cfg = neighbor_cfg.get(ip, {})
@@ -459,9 +505,9 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
             continue
 
         print(f"  neighbor {ip} ({afi}, group={group or 'unknown'}):", file=sys.stderr)
-        adv_text, rec_text = collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, use_sample_dir)
-        adv_routes = parse_routes(adv_text)
-        rec_routes = parse_routes(rec_text)
+        adv_text, rec_text = collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, device_type, use_sample_dir)
+        adv_routes = route_parser(adv_text)
+        rec_routes = route_parser(rec_text)
 
         # Static fallback: communities as configured in the route-policy text.
         # Overridden per-prefix below when --with-communities pulls the exact
@@ -508,7 +554,12 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--devices", default="devices.csv", help="CSV: location,hostname,mgmt_ip,device_type,port")
+    ap.add_argument("--devices", default="devices.csv",
+                    help="CSV: location,hostname,mgmt_ip,device_type,port,neighbor_ip,afi "
+                         "(neighbor_ip/afi are optional - set them to target one specific "
+                         "neighbor directly instead of full-device discovery; required for "
+                         "Junos devices right now, since full discovery isn't supported for "
+                         "that platform yet)")
     ap.add_argument("--aggregates", default="aggregates.csv",
                     help="CSV: location,aggregate_cidr,classification,description")
     ap.add_argument("--out", default="bgp_prework.xlsx", help="Output Excel path")
@@ -594,28 +645,48 @@ def main():
 
     for dev in devices:
         location, hostname = dev["location"], dev["hostname"]
+        device_type = dev.get("device_type", "cisco_xr")
+        is_junos = device_type.startswith("juniper")
+        # Optional override: a devices.csv row can name one specific
+        # neighbor_ip (+ afi, default ipv4) to check directly, skipping
+        # full-device neighbor discovery. Needed for Junos right now, since
+        # `show bgp summary` / `show configuration protocols bgp` parsers
+        # for Junos aren't built yet (no validated sample) - this lets you
+        # target one known neighbor without needing those.
+        target_neighbor = dev.get("neighbor_ip", "").strip()
+        target_afi = (dev.get("afi") or "ipv4").strip().lower()
+
         print(f"[{location}] {hostname}: collecting...", file=sys.stderr)
 
         if use_sample_dir:
             conn_or_dir = args.sample_dir
-            outputs = collect_from_device(conn_or_dir, hostname, use_sample_dir=True)
         else:
             conn = ConnectHandler(
-                device_type=dev.get("device_type", "cisco_xr"),
+                device_type=device_type,
                 host=dev["mgmt_ip"], username=username, password=password,
                 port=int(dev.get("port") or 22),
             )
             conn_or_dir = conn
-            outputs = collect_from_device(conn, hostname, use_sample_dir=False)
 
-        neighbor_cfg = parse_bgp_running_config(outputs["running_bgp"])
-        communities_by_policy = parse_route_policy_communities(outputs["running_bgp"])
-        summary_v4_ips = parse_bgp_summary(outputs["summary_v4"])
-        summary_v6_ips = parse_bgp_summary(outputs["summary_v6"])
+        if target_neighbor:
+            neighbor_cfg, communities_by_policy = {}, {}
+            summary_v4_ips = [target_neighbor] if target_afi == "ipv4" else []
+            summary_v6_ips = [target_neighbor] if target_afi == "ipv6" else []
+        elif is_junos:
+            sys.exit(f"[{location}] {hostname}: Junos device with no neighbor_ip set in devices.csv - "
+                     f"full-device discovery isn't supported for Junos yet (no validated `show bgp "
+                     f"summary`/`show configuration protocols bgp` parser). Add a neighbor_ip column "
+                     f"value for this row to target a specific neighbor instead.")
+        else:
+            outputs = collect_from_device(conn_or_dir, hostname, use_sample_dir=use_sample_dir)
+            neighbor_cfg = parse_bgp_running_config(outputs["running_bgp"])
+            communities_by_policy = parse_route_policy_communities(outputs["running_bgp"])
+            summary_v4_ips = parse_bgp_summary(outputs["summary_v4"])
+            summary_v6_ips = parse_bgp_summary(outputs["summary_v6"])
 
         rows = build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
                           summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir,
-                          args.with_communities, neighbor_group_filter)
+                          args.with_communities, neighbor_group_filter, device_type)
         all_rows.extend(rows)
 
         if not use_sample_dir:
