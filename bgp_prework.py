@@ -303,24 +303,39 @@ def parse_route_policy_communities(config_text):
 
 
 ROUTE_LINE_RE = re.compile(
-    r"^\s*(?P<prefix>\d+\.\d+\.\d+\.\d+/\d+|[0-9a-fA-F:]+/\d+)\s+(?P<nexthop>\S+)\s+(?P<rest>.+?)\s*$"
+    r"^\s*(?:[*>sdhirSN]+\s+)?(?P<prefix>\d+\.\d+\.\d+\.\d+/\d+|[0-9a-fA-F:]+/\d+)"
+    r"\s+(?P<nexthop>\S+)\s+(?P<rest>.+?)\s*$"
 )
 
 
 def parse_routes(show_routes_text):
     """
-    Parses `advertised-routes` / `received-routes` output -> [{prefix, next_hop, as_path}].
+    Parses `advertised-routes` / `received routes` output -> [{prefix, next_hop, as_path}].
 
-    Real IOS-XR format (confirmed against live output, not the classic-IOS
-    metric/locprf/weight table this originally assumed):
+    IOS-XR uses TWO DIFFERENT table formats depending on the command
+    (confirmed against real output from both) - `advertised-routes` uses a
+    simple table with no status markers and a concatenated AS+origin:
         Network            Next Hop        From            AS Path
         10.1.194.0/23      24.93.64.1      24.27.242.37    19115?
         24.27.242.0/23     24.93.64.1      Local Aggregate 19115i
 
-    "From" can be 1 or 2 words (a peer IP, "Local", or "Local Aggregate"), so
-    rather than guess its width, we take the last whitespace token as the AS
-    path (with origin code attached) and ignore "From" - it isn't part of the
-    target sheet schema.
+    but `received routes` (note: two words, not hyphenated - see
+    collect_routes_for_neighbor) uses the classic full BGP table format,
+    with leading status markers (*, >, s, d, h, i, r, S, N - combinable,
+    e.g. "*>" for valid+best) and a separate Metric/LocPrf/Weight/AS-path
+    with the origin code space-separated instead of concatenated:
+        Status codes: s suppressed, d damped, h history, * valid, > best
+        Origin codes: i - IGP, e - EGP, ? - incomplete
+           Network            Next Hop            Metric LocPrf Weight Path
+        *> 10.1.194.0/23      24.93.64.3                             0 19115 ?
+        *> 22.80.64.0/19      24.93.64.3               0             0 19115 i
+
+    The optional leading status-marker group handles the second format; for
+    the AS-path, if the last token is a bare origin code (space-separated
+    from the AS number), the trailing "<asn> <origin>" pair is taken
+    together - otherwise (concatenated, or no origin code present) just the
+    last token is used. "From"/Metric/LocPrf/Weight columns are dropped
+    either way - not part of the target sheet schema.
     """
     routes = []
     for line in show_routes_text.splitlines():
@@ -328,7 +343,12 @@ def parse_routes(show_routes_text):
         if not m:
             continue
         rest_tokens = m.group("rest").split()
-        as_path = rest_tokens[-1] if rest_tokens else ""
+        if len(rest_tokens) >= 2 and rest_tokens[-1] in ("I", "E", "?", "i", "e"):
+            as_path = " ".join(rest_tokens[-2:])
+        elif rest_tokens:
+            as_path = rest_tokens[-1]
+        else:
+            as_path = ""
         routes.append({"prefix": m.group("prefix"), "next_hop": m.group("nexthop"), "as_path": as_path})
     return routes
 
