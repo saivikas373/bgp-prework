@@ -366,42 +366,6 @@ def parse_prefix_detail_communities(detail_text):
     return chosen.replace(" ", ";")
 
 
-JUNOS_ROUTE_LINE_RE = re.compile(
-    r"^\s*\*?\s*(?P<prefix>\d+\.\d+\.\d+\.\d+/\d+|[0-9a-fA-F:]+/\d+)\s+(?P<nexthop>\S+)\s*(?P<rest>.*?)\s*$"
-)
-
-
-def parse_junos_receive_protocol(text):
-    """
-    Parses Junos `show route receive-protocol bgp <neighbor-ip>` output ->
-    [{prefix, next_hop, as_path}]. Real format:
-
-        Prefix                  Nexthop              MED     Lclpref    AS path
-        * 10.1.194.0/23           24.93.64.1                              19115 ?
-        * 22.80.64.0/19           24.93.64.1           0                  19115 I
-
-    MED/Lclpref are frequently blank (not zero-padded), so column position
-    isn't reliable - instead, take everything after the next-hop and treat
-    the trailing "<asn> <origin-code>" (or just "<asn>" with no origin code
-    on some lines) as the AS path, matching your example sheet's "19115 ?"
-    format (space-separated, unlike IOS-XR's concatenated "19115i").
-    """
-    routes = []
-    for line in text.splitlines():
-        m = JUNOS_ROUTE_LINE_RE.match(line)
-        if not m:
-            continue
-        rest_tokens = m.group("rest").split()
-        if len(rest_tokens) >= 2 and rest_tokens[-1] in ("I", "E", "?", "i", "e"):
-            as_path = " ".join(rest_tokens[-2:])
-        elif rest_tokens:
-            as_path = rest_tokens[-1]
-        else:
-            as_path = ""
-        routes.append({"prefix": m.group("prefix"), "next_hop": m.group("nexthop"), "as_path": as_path})
-    return routes
-
-
 def parse_bgp_summary(show_summary_text):
     """Parses `show bgp ipv4/ipv6 unicast summary` -> list of neighbor IPs."""
     ips = []
@@ -482,16 +446,27 @@ def parse_junos_routes(show_routes_text):
         * 22.80.64.0/19      24.93.64.1                               19115 11426 I
 
     Leading `*` marks the active route; nexthop is "Self" on advertised
-    routes toward the peer. MED/Lclpref may or may not be present, so -
-    like the XR parser - everything after prefix+nexthop is kept together
-    as the as_path field rather than guessing fixed column widths.
+    routes toward the peer. MED/Lclpref are frequently blank (not
+    zero-padded) but not always - verified against real output where one
+    row out of fifteen had a MED of "0", which leaked into as_path when this
+    just kept everything after nexthop verbatim. Column position isn't
+    reliable either (MED/Lclpref being blank shifts everything left), so
+    instead: split the tail into tokens and take the trailing "<asn>
+    <origin-code>" (or just "<asn>" if no origin code is present on that
+    line) as the AS path, discarding any MED/Lclpref tokens in between.
     """
     routes = []
     for line in show_routes_text.splitlines():
         m = JUNOS_ROUTE_LINE_RE.match(line)
         if not m:
             continue
-        as_path = m.group("rest").strip()
+        rest_tokens = m.group("rest").split()
+        if len(rest_tokens) >= 2 and rest_tokens[-1] in ("I", "E", "?", "i", "e"):
+            as_path = " ".join(rest_tokens[-2:])
+        elif rest_tokens:
+            as_path = rest_tokens[-1]
+        else:
+            as_path = ""
         routes.append({"prefix": m.group("prefix"), "next_hop": m.group("nexthop"), "as_path": as_path})
     return routes
 
@@ -735,13 +710,6 @@ def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform="iosxr"
         rec_file = base / f"received_{ip.replace(':', '_')}.txt"
         adv = adv_file.read_text() if adv_file.exists() else ""
         rec = rec_file.read_text() if rec_file.exists() else ""
-    elif is_junos:
-        conn = conn_or_dir
-        # Junos "advertised-protocol" side not yet validated against real
-        # output - only `receive-protocol` (received side) is supported so
-        # far. Extend this once real advertised-side output is available.
-        adv = ""
-        rec = _run(conn, f"show route receive-protocol bgp {ip}")
     else:
         conn = conn_or_dir
         if platform == "junos":
@@ -866,11 +834,10 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--devices", default="devices.csv",
-                    help="CSV: location,hostname,mgmt_ip,device_type,port,neighbor_ip,afi "
-                         "(neighbor_ip/afi are optional - set them to target one specific "
-                         "neighbor directly instead of full-device discovery; required for "
-                         "Junos devices right now, since full discovery isn't supported for "
-                         "that platform yet)")
+                    help="CSV: location,hostname,mgmt_ip,device_type,port. device_type is a "
+                         "netmiko value - cisco_xr/cisco_xe for IOS-XR/XE, or juniper_junos "
+                         "for Junos (full neighbor discovery supported on both platforms). "
+                         "Use --neighbor-ips to scope a run to specific neighbors.")
     ap.add_argument("--aggregates", default="aggregates.csv",
                     help="CSV: location,aggregate_cidr,classification,description")
     ap.add_argument("--out", default="bgp_prework.xlsx", help="Output Excel path")

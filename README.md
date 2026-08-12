@@ -9,20 +9,17 @@ team's route manipulation still works once the rename lands.
 Validated against real ASR9K/IOS-XR output (running-config, `summary`,
 `advertised-routes`, and per-prefix `show bgp ... <prefix>` detail) — parser
 format assumptions were corrected against actual command output rather than
-guessed. Also supports Junos for the *received*-side check only (see
-"Multi-vendor support" below) — validated against real
-`show route receive-protocol bgp <neighbor-ip>` output.
+guessed. Also supports Junos (`device_type=juniper_junos`) — see
+"Multi-vendor support" below for exactly which Junos parsers are validated
+against real output vs. synthetic-only so far.
 
 ## Files
 
 - `devices.csv` — fill in the locations: hostname, mgmt IP, `device_type`
-  (netmiko value — `cisco_xr`, `cisco_xe`, or `juniper_junos`), SSH port.
-  Two optional columns, `neighbor_ip` and `afi` (default `ipv4`): if set,
-  the script checks *only* that one neighbor instead of discovering every
-  neighbor on the device. **Required for Junos rows** — full-device
-  discovery (`show bgp summary` / `show configuration protocols bgp`
-  equivalents) isn't supported for Junos yet, only checking one already-known
-  neighbor is.
+  (netmiko value — `cisco_xr`/`cisco_xe` for Cisco, `juniper_junos` for
+  Junos), SSH port. Full neighbor discovery works on both platforms — no
+  need to hand-specify a neighbor IP. Use `--neighbor-ips`/`--neighbor-groups`
+  (see below) to scope a run to specific neighbors.
 - `aggregates.csv` — fill in the CIDR block(s) your team owns per location,
   plus a `classification` per block: `Public` (freely advertised) or
   `Private GUA` (real public-IP space you own but the NOC team wants kept off
@@ -94,6 +91,12 @@ process neighbors on those specific neighbor-groups, skipping everything else
 (ELF, SPINE, etc. entirely, not just filtering them out afterward). Use this
 when the prework is scoped to the groups you're actually renaming.
 
+Prefer `--neighbor-ips 24.93.64.1,24.93.64.3` (also comma-separated, no space)
+when you want to scope to *exact* neighbor addresses instead — a real
+neighbor-group was found bundling multiple unrelated neighbors under one
+shared policy, so `--neighbor-groups` alone doesn't guarantee you're only
+looking at the neighbor you actually meant. Both filters can be combined.
+
 Add `--discover-aggregates discovered.csv` to skip the full prework pull and
 just parse each device's running-config for `network`/`aggregate-address`
 statements, writing a candidate `aggregates.csv` for you to review — saves
@@ -127,27 +130,54 @@ the groups.
 
 ## Multi-vendor support
 
-The script was originally IOS-XR-only. Junos support was added for a
-specific use case: checking what an *upstream* device actually receives from
-an ELF-side neighbor, as a cross-check against what the ELF side shows itself
-advertising.
+The script was originally IOS-XR-only. Junos support (`device_type=
+juniper_junos` in `devices.csv`) was added afterward for checking what an
+*upstream* device actually receives from an ELF-side neighbor, as a
+cross-check against what the ELF side shows itself advertising. It's now a
+full parallel implementation, not just the receive-side: `show bgp summary`
+(neighbor discovery), `show configuration protocols bgp` +
+`show configuration policy-options` (neighbor-group/remote-AS/policy/
+community context), and both `show route advertising-protocol bgp <ip>` /
+`show route receive-protocol bgp <ip>` (route pulls) all have Junos parsers,
+mirroring the IOS-XR code paths.
 
-- **Supported**: `show route receive-protocol bgp <neighbor-ip>` (the
-  "received" side), via `device_type=juniper_junos` in `devices.csv` with a
-  `neighbor_ip` set. Prefix/next-hop/AS-path all parse correctly, verified
-  against real `rcr01chrcnctr-re0` output.
-- **Not supported yet**: Junos advertised-routes (`show route
-  advertising-protocol bgp ...`), Junos running-config parsing (`show
-  configuration protocols bgp` — needed for neighbor-group-equivalent/
-  remote-AS/policy columns), and Junos `show bgp summary` (needed for
-  full-device neighbor discovery, which is why `neighbor_ip` is required for
-  Junos rows right now). None of these were guessed at — they're just not
-  built because no real sample output has been seen yet. Paste real output
-  for any of these and they can be added the same way the received-side
-  parser was.
-- On a Junos row, `neighbor_group`/`remote_as`/`description`/`policy_out`/
-  `policy_in`/`communities` all come back blank — that config-derived context
-  only exists for IOS-XR rows currently.
+**Validation status matters here — don't treat all of this as equally
+trustworthy yet:**
+- The route-pull parser (`parse_junos_routes`) **is** verified against real
+  device output (`rcr01chrcnctr-re0`, neighbor `24.93.64.1`) — and that
+  verification caught a real bug (a MED value leaking into the `as_path`
+  field on one row out of fifteen), now fixed.
+- The summary/config/policy parsers (`parse_junos_bgp_summary`,
+  `parse_junos_bgp_config`, `parse_junos_policy_communities`) were written
+  from Junos conventions and validated only against synthetic sample-dir
+  output, **not yet against real device output** — same situation the
+  IOS-XR parsers were in before real output showed the `advertised-routes`
+  format assumption was wrong. Run `--sample-dir` against real captured
+  output for these commands before trusting a live run's `neighbor_group`/
+  `remote_as`/`description`/`policy_out`/`policy_in`/`communities` columns
+  on Junos rows.
+- `--discover-aggregates` still only supports IOS-XR — Junos devices are
+  skipped with a message telling you to fill in `aggregates.csv` by hand for
+  those rows (would need `show configuration policy-options` +
+  `routing-options` parsing to automate).
+
+Other things the parallel Junos work found and fixed, worth knowing about
+regardless of platform:
+- **`--neighbor-ips <ip1>,<ip2>`** (exact BGP neighbor address match) is more
+  precise than `--neighbor-groups` — a real neighbor-group was found to
+  bundle multiple unrelated neighbor IPs under one shared policy, so group
+  filtering alone doesn't guarantee you're only looking at the neighbor you
+  meant.
+- **Connection recovery**: one neighbor with a genuinely huge route table can
+  stall badly enough that netmiko's prompt-tracking gets left pointed at
+  leftover buffered data, silently breaking every subsequent command on that
+  same SSH session. The script now detects a stalled route pull and drops/
+  re-establishes the connection rather than letting one bad peer poison every
+  result queued after it.
+- **Per-device failure isolation**: if one device is unreachable or times out
+  during connection setup, that device is skipped (and listed in a
+  `failed_devices` summary at the end) instead of the whole run losing every
+  row already collected from devices processed earlier.
 
 ## Known limitations
 
