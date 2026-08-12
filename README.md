@@ -128,6 +128,37 @@ A second sheet, `neighbor_group_summary`, gives route counts per
 neighbor-group/neighbor — a quick before/after sanity check once you rename
 the groups.
 
+## Cross-checking advertised vs. received (compare_advertised_received.py)
+
+Running `bgp_prework.py` on the ELF side gives you what it *advertises*;
+running it on the upstream/RCR side gives you what that neighbor *receives*.
+Those two should match exactly - any gap means something's silently dropping
+or altering routes between the two, which is exactly what you want to catch
+both before and after the neighbor-group rename.
+
+```bash
+cp pairs.example.csv pairs.csv   # edit with your real hostnames/neighbor IPs
+python compare_advertised_received.py --pre bgppre.xlsx --rcr bgprcr.xlsx --pairs pairs.csv --out reconciliation.xlsx
+```
+
+- `--pre` — workbook with the ELF-side `advertised (out)` rows
+- `--rcr` — workbook with the upstream-side `received (in)` rows (can be the
+  same file as `--pre` if one combined run covered both directions)
+- `pairs.csv` — maps which ELF hostname+neighbor corresponds to which
+  RCR-side hostname+neighbor (a link has two ends; the script needs to know
+  which two device/neighbor combos represent the same physical session)
+
+Output (`reconciliation.xlsx`) has three sheets: `summary` (counts per pair),
+`detail` (every prefix, status = matched/missing/unexpected), and
+`mismatches_only` (just the ones worth investigating). `MISSING` means
+advertised but not confirmed received on the other end; `UNEXPECTED` means
+received but not in the advertised list — check that side's `advertised-routes`
+pull, since it can also just mean two runs weren't from the same point in time.
+
+Run this once now (baseline, before the rename) and again after standardizing
+the neighbor-groups — if the mismatch counts are still zero both times, the
+rename didn't change what's actually getting through.
+
 ## Multi-vendor support
 
 The script was originally IOS-XR-only. Junos support (`device_type=
