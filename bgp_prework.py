@@ -669,6 +669,29 @@ def _run(conn, cmd, delay_factor=1):
     return conn.send_command(cmd, delay_factor=delay_factor)
 
 
+def _recover_connection(conn):
+    """
+    Best-effort recovery after a command that never returned its expected
+    prompt (typically a huge route dump on an unrelated large peer, e.g. a
+    full-table transit session). netmiko's internal prompt-tracking can be
+    left pointed at leftover buffered route data instead of the real
+    device prompt after a stall like that - which then makes *every
+    subsequent* command on the same SSH session fail too, even small ones
+    on completely unrelated neighbors. Drop and re-establish the session
+    rather than keep reusing a connection that may be in that state.
+    """
+    try:
+        conn.disconnect()
+    except Exception:
+        pass
+    try:
+        conn.establish_connection()
+        conn.session_preparation()
+    except Exception as e:
+        print(f"    ! could not recover connection after a stalled command ({e}) - "
+              f"remaining pulls on this device will likely keep failing.", file=sys.stderr)
+
+
 def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform="iosxr", use_sample_dir=False):
     if use_sample_dir:
         base = Path(conn_or_dir) / hostname
@@ -681,19 +704,22 @@ def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform="iosxr"
         if platform == "junos":
             table_suffix = " table inet6.0" if afi == "ipv6" else ""
             try:
-                adv = _run(conn, f"show route advertising-protocol bgp {ip}{table_suffix}", delay_factor=8)
+                adv = _run(conn, f"show route advertising-protocol bgp {ip}{table_suffix}", delay_factor=4)
             except Exception as e:
                 print(f"    ! advertised-routes pull for {ip} failed/timed out ({e}) - "
-                      f"treating as empty and continuing. Likely a large table on this peer; "
-                      f"re-run scoped to just this neighbor-group if it keeps happening.",
+                      f"treating as empty, recovering the connection, and continuing. Likely "
+                      f"a large table on this peer; re-run scoped to just the neighbor-group "
+                      f"you actually need (--neighbor-groups) to skip it entirely.",
                       file=sys.stderr)
                 adv = ""
+                _recover_connection(conn)
             try:
-                rec = _run(conn, f"show route receive-protocol bgp {ip}{table_suffix}", delay_factor=8)
+                rec = _run(conn, f"show route receive-protocol bgp {ip}{table_suffix}", delay_factor=4)
             except Exception as e:
                 print(f"    ! received-routes pull for {ip} failed/timed out ({e}) - "
-                      f"treating as empty and continuing.", file=sys.stderr)
+                      f"treating as empty, recovering the connection, and continuing.", file=sys.stderr)
                 rec = ""
+                _recover_connection(conn)
         else:
             adv = _run(conn, f"show bgp {afi} unicast neighbors {ip} advertised-routes")
             try:
