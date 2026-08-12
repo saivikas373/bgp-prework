@@ -784,10 +784,20 @@ def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, platform="ios
         text = fp.read_text() if fp.exists() else ""
     else:
         conn = conn_or_dir
-        if platform == "junos":
-            text = _run(conn, f"show route {prefix} extensive")
-        else:
-            text = _run(conn, f"show bgp {afi} unicast {prefix}")
+        cmd = (f"show route {prefix} extensive" if platform == "junos"
+               else f"show bgp {afi} unicast {prefix}")
+        try:
+            # A prefix like 0.0.0.0/0 can have a huge extensive/detail
+            # output (many candidate paths) - same slow-peer risk as the
+            # main route pulls, so it gets the same delay_factor bump and
+            # recovery-on-failure instead of taking down the whole device.
+            text = _run(conn, cmd, delay_factor=4)
+        except Exception as e:
+            print(f"    ! community pull for {prefix} failed/timed out ({e}) - "
+                  f"treating as no communities found, recovering the connection, "
+                  f"and continuing.", file=sys.stderr)
+            _recover_connection(conn)
+            text = ""
     parser = parse_junos_prefix_communities if platform == "junos" else parse_prefix_detail_communities
     return parser(text)
 
