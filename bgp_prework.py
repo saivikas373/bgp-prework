@@ -734,9 +734,19 @@ def collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform="iosxr"
         else:
             adv = _run(conn, f"show bgp {afi} unicast neighbors {ip} advertised-routes")
             try:
-                rec = _run(conn, f"show bgp {afi} unicast neighbors {ip} received-routes")
+                # "received routes" (two words) - confirmed against real
+                # IOS-XR CLI, not hyphenated like "advertised-routes" is.
+                rec = _run(conn, f"show bgp {afi} unicast neighbors {ip} received routes")
+                first_line = rec.splitlines()[0] if rec.strip() else ""
+                if not rec.strip() or first_line.startswith("%"):
+                    print(f"    ! received-routes for {ip} came back empty/errored - if this "
+                          f"neighbor should be receiving prefixes, check "
+                          f"`soft-reconfiguration inbound` is set for its group (needed for "
+                          f"IOS-XR to show the pre-policy Adj-RIB-In).", file=sys.stderr)
             except Exception:
-                # needs `bgp neighbor soft-reconfiguration inbound` or route-refresh capability
+                print(f"    ! received-routes pull for {ip} failed - needs "
+                      f"`soft-reconfiguration inbound` configured on this neighbor/group, or "
+                      f"route-refresh capability. Treating as empty.", file=sys.stderr)
                 rec = ""
     return adv, rec
 
