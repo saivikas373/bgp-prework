@@ -753,7 +753,7 @@ def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, platform="ios
 
 def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
                summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir, with_communities,
-               neighbor_group_filter=None, platform="iosxr"):
+               neighbor_group_filter=None, platform="iosxr", neighbor_ip_filter=None):
     rows = []
     all_ips = [(ip, "ipv4") for ip in summary_v4_ips] + [(ip, "ipv6") for ip in summary_v6_ips]
     route_parser = parse_junos_routes if platform == "junos" else parse_routes
@@ -761,6 +761,11 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
     for ip, afi in all_ips:
         cfg = neighbor_cfg.get(ip, {})
         group = cfg.get("neighbor_group") or ""
+
+        if neighbor_ip_filter and ip not in neighbor_ip_filter:
+            print(f"  neighbor {ip} ({afi}, group={group or 'unknown'}): skipped, "
+                  f"not in --neighbor-ips filter", file=sys.stderr)
+            continue
 
         if neighbor_group_filter and group.upper() not in neighbor_group_filter:
             print(f"  neighbor {ip} ({afi}, group={group or 'unknown'}): skipped, "
@@ -838,12 +843,24 @@ def main():
                     help="Comma-separated neighbor-group names to include (case-insensitive), "
                          "e.g. IPV4_CORE,IPV6_CORE. Neighbors on any other group (ELF, SPINE, "
                          "etc.) are skipped entirely - useful when the prework is only about "
-                         "the groups you're actually renaming. Default: no filter, all neighbors.")
+                         "the groups you're actually renaming. Default: no filter, all neighbors. "
+                         "A neighbor-group can contain multiple neighbor IPs sharing the same "
+                         "policy - use --neighbor-ips instead if you need exactly one IP.")
+    ap.add_argument("--neighbor-ips", default=None,
+                    help="Comma-separated exact neighbor IPs to include, e.g. "
+                         "24.93.64.1,24.93.64.3 - skips every other neighbor on the device "
+                         "regardless of what neighbor-group it's in. No space after commas. "
+                         "Combine with --neighbor-groups if you want both narrowed further "
+                         "(a neighbor must pass both filters to be included).")
     args = ap.parse_args()
 
     neighbor_group_filter = (
         {g.strip().upper() for g in args.neighbor_groups.split(",")}
         if args.neighbor_groups else None
+    )
+    neighbor_ip_filter = (
+        {ip.strip() for ip in args.neighbor_ips.split(",")}
+        if args.neighbor_ips else None
     )
 
     if args.discover_aggregates:
@@ -940,7 +957,7 @@ def main():
 
             rows = build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
                               summary_v4_ips, summary_v6_ips, conn_or_dir, use_sample_dir,
-                              args.with_communities, neighbor_group_filter, platform)
+                              args.with_communities, neighbor_group_filter, platform, neighbor_ip_filter)
             all_rows.extend(rows)
         except Exception as e:
             print(f"[{location}] {hostname}: FAILED ({e}) - skipping this device, keeping "
