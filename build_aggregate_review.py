@@ -23,18 +23,39 @@ def main():
     args = ap.parse_args()
 
     df = pd.read_excel(args.input, engine="openpyxl")
-    df = df[df["Agg"].notna() & (df["Agg"] != "")]
+    df = df[df["prefix"].notna() & (df["prefix"] != "")]
+
+    RESERVED_LABELS = {"RFC 1918", "CGNAT (RFC 6598)", "ULA (RFC 4193)", "Link-Local"}
+
+    matched = df[df["Agg"].notna() & (df["Agg"] != "")]
+
+    # Prefixes with no Agg match: only worth surfacing if they're something
+    # WE actually advertise (not just a route we received from someone else)
+    # and not already auto-classified by a reserved range (RFC1918/CGNAT/
+    # etc. - those don't need aggregate tracking, they're never internet-
+    # routable regardless). What's left is a real gap: a prefix we're
+    # advertising with no entry in aggregates.csv/discovered.csv at all -
+    # e.g. a standalone /32 that never got folded into a bigger block.
+    unmatched = df[
+        (df["Agg"].isna() | (df["Agg"] == ""))
+        & (df["direction"] == "advertised (out)")
+        & (df["prefix"] != "0.0.0.0/0")
+        & (~df["IP Classification"].isin(RESERVED_LABELS))
+    ].copy()
+    unmatched["Agg"] = unmatched["prefix"]  # candidate: the prefix is its own (untracked) aggregate
 
     rows = []
-    for agg, group in df.groupby("Agg"):
+    for agg, group in pd.concat([matched, unmatched]).groupby("Agg"):
         prefixes = sorted(group["prefix"].dropna().unique())
         hostnames = sorted(group["hostname"].dropna().unique())
         directions = sorted(group["direction"].dropna().unique())
         classifications_seen = sorted(group["IP Classification"].dropna().unique())
         communities_seen = sorted({c for c in group["communities"].dropna().unique() if c})
+        in_known_aggregates = agg not in set(unmatched["Agg"])
 
         rows.append({
             "aggregate_cidr": agg,
+            "in_aggregates_csv": "yes" if in_known_aggregates else "NO - add this",
             "classification": "TBD",  # fill in: Public / Private GUA
             "prefix_count": len(prefixes),
             "prefixes": ", ".join(prefixes),
@@ -45,14 +66,16 @@ def main():
         })
 
     out_df = pd.DataFrame(rows, columns=[
-        "aggregate_cidr", "classification", "prefix_count", "prefixes",
+        "aggregate_cidr", "in_aggregates_csv", "classification", "prefix_count", "prefixes",
         "hostnames", "directions_seen", "current_classification_in_data", "communities_seen",
-    ]).sort_values("aggregate_cidr")
+    ]).sort_values(["in_aggregates_csv", "aggregate_cidr"])
 
     with pd.ExcelWriter(args.out, engine="openpyxl") as writer:
         out_df.to_excel(writer, sheet_name="aggregates", index=False)
 
-    print(f"Wrote {len(out_df)} unique aggregate blocks to {args.out}. "
+    untracked_count = (out_df["in_aggregates_csv"] != "yes").sum()
+    print(f"Wrote {len(out_df)} unique aggregate blocks to {args.out} "
+          f"({untracked_count} not yet in aggregates.csv - marked 'NO - add this'). "
           f"Fill in the 'classification' column (TBD -> Public or Private GUA), "
           f"then feed it back into aggregates.csv for future runs.")
 
