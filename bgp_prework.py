@@ -936,6 +936,16 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
             route_parser = parse_routes
         adv_routes = route_parser(adv_text)
         rec_routes = route_parser(rec_text)
+        # Same self-diagnosis pattern as the community parser: if a command
+        # returned substantial text but 0 routes came out of it, that's a
+        # real format mismatch worth seeing immediately, not just "0
+        # results" that looks identical to "genuinely no routes".
+        for label, text, parsed in (("advertised-routes", adv_text, adv_routes),
+                                     ("received-routes", rec_text, rec_routes)):
+            if not parsed and len(text.splitlines()) > 3:
+                print(f"    ! 0 routes parsed from {label} for {ip} despite "
+                      f"{len(text.splitlines())} lines returned - full raw output:\n"
+                      f"------\n{text}\n------", file=sys.stderr)
 
         # Static fallback: communities as configured in the route-policy text.
         # Overridden per-prefix below when --with-communities pulls the exact
