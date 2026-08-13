@@ -373,7 +373,11 @@ def parse_prefix_detail_communities(detail_text):
     """
     # re.split() on a zero-width lookahead needs Python 3.7+; the jump
     # server runs 3.6, so slice on match start positions manually instead.
-    starts = [m.start() for m in re.finditer(r"^Path #\d+:", detail_text, flags=re.MULTILINE)]
+    # "Path #N:" and "Community:" lines are NOT reliably flush-left - real
+    # captured output showed some prefixes indented (2 spaces) and others
+    # not, on the same device/command. Match regardless of leading
+    # whitespace rather than assuming column 0.
+    starts = [m.start() for m in re.finditer(r"^\s*Path #\d+:", detail_text, flags=re.MULTILINE)]
     if not starts:
         comm_match = re.search(r"^\s*Community:\s*(.+)$", detail_text, flags=re.MULTILINE)
         return comm_match.group(1).strip().replace(" ", ";") if comm_match else ""
@@ -385,7 +389,7 @@ def parse_prefix_detail_communities(detail_text):
     for block in blocks:
         if not block.strip().startswith("Path #"):
             continue
-        comm_match = re.search(r"^Community:\s*(.+)$", block, flags=re.MULTILINE)
+        comm_match = re.search(r"^\s*Community:\s*(.+)$", block, flags=re.MULTILINE)
         communities = comm_match.group(1).strip() if comm_match else ""
         if first_communities is None:
             first_communities = communities
@@ -828,15 +832,14 @@ def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, platform="ios
     result = parser(text)
     if not result and text.strip():
         # Command succeeded and returned something, but the parser found no
-        # communities in it - most likely a real format variant we haven't
-        # seen yet (e.g. IOS-XR's single-path table entries may not use the
-        # "Path #N:" labeling the multi-path parser looks for). Print a
-        # snippet so this is diagnosable from the same run instead of
-        # needing a separate follow-up just to see the raw output.
-        snippet = "\n".join(text.splitlines()[:12])
+        # communities in it. Print the FULL output (not a truncated snippet -
+        # a 12-line cutoff previously cut this off right before the
+        # "Community:" line, which typically appears well into each
+        # "Path #N:" block, making a real parser bug look like "no data").
+        # These outputs are only 20-30 lines, no reason to truncate.
         print(f"    ! no communities found in output for {prefix} (command succeeded, "
-              f"{len(text.splitlines())} lines returned) - raw output snippet:\n"
-              f"------\n{snippet}\n------", file=sys.stderr)
+              f"{len(text.splitlines())} lines returned) - full raw output:\n"
+              f"------\n{text}\n------", file=sys.stderr)
     return result
 
 
