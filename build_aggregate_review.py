@@ -34,7 +34,7 @@ def main():
     unmatched = df[
         (df["Agg"].isna() | (df["Agg"] == ""))
         & (df["direction"] == "advertised (out)")
-        & (df["prefix"] != "0.0.0.0/0")
+        & (~df["prefix"].isin(["0.0.0.0/0", "::/0"]))
     ].copy()
     unmatched["Agg"] = unmatched["prefix"]  # candidate: the prefix is its own (untracked) aggregate
 
