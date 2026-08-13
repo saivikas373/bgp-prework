@@ -359,8 +359,12 @@ IPV6_BARE_ADDR_RE = re.compile(r"^(?P<addr>[0-9a-fA-F:]+)\s*$")
 
 def parse_ios_xr_ipv6_routes(show_routes_text):
     """
-    Parses IOS-XR `show bgp ipv6 unicast neighbors <ip> advertised-routes` /
-    `received routes` output -> [{prefix, next_hop, as_path}].
+    Parses IOS-XR `show bgp ipv6 unicast neighbors <ip> advertised-routes`
+    output -> [{prefix, next_hop, as_path}].
+
+    NOTE: `received routes` uses a DIFFERENT format on IOS-XR IPv6 (the
+    classic `*>`-marked table style, not this one) - see
+    parse_ios_xr_ipv6_classic_routes() for that.
 
     Unlike IPv4 (one route per line), IOS-XR wraps each IPv6 route across
     MULTIPLE lines - confirmed against real output - because the addresses
@@ -405,6 +409,85 @@ def parse_ios_xr_ipv6_routes(show_routes_text):
         if m:
             flush(current)
             current = {"prefix": m.group("prefix"), "lines": []}
+            continue
+        if current is not None:
+            current["lines"].append(line)
+    flush(current)
+    return routes
+
+
+IPV6_CLASSIC_RECORD_START_RE = re.compile(
+    r"^(?:[*>sdhirSN]+\s+)?(?P<prefix>[0-9a-fA-F:]+/\d+)\s*(?P<rest>.*)$"
+)
+IPV6_BARE_IP_TOKEN_RE = re.compile(r"^[0-9a-fA-F:]+$")
+
+
+def parse_ios_xr_ipv6_classic_routes(show_routes_text):
+    """
+    Parses IOS-XR `show bgp ipv6 unicast neighbors <ip> received routes`
+    output -> [{prefix, next_hop, as_path}]. Confirmed against real output -
+    this is the classic `*>`-marked full BGP table (like IPv4's `received
+    routes`), but ALSO wrapped across multiple lines like the IPv6
+    advertised-routes format, and the wrapping is inconsistent: short
+    entries fit prefix+nexthop on one line, longer ones don't:
+
+        Status codes: ... * valid, > best ...
+           Network            Next Hop            Metric LocPrf Weight Path
+        *> ::/0               2606:a000:0:4::74
+                                                             0 11426 i
+
+        *> 2600:6c7f:9370::/44
+                              2606:a000:0:4::77
+                                       0             0 19115 i
+        *> 2600:6c7f:9370:0:2::/80
+                              2606:a000:0:4::77
+                                                     0 19115 i
+
+    A record starts at a line with an optional status marker (*, >, etc)
+    followed by a prefix - the rest of that line, plus every line after it
+    up to the next record (or a blank/"Processed N prefixes" line), belongs
+    to this record. Next-hop is the first bare IP-only token found anywhere
+    in the record (whether trailing the prefix on line 1, or alone on its
+    own line). AS-path is the last non-empty line, trimmed to just the
+    trailing "<asn> <origin>" (or single last token) to strip the leading
+    Metric/LocPrf/Weight numbers mixed in on that same line - unlike the
+    advertised-routes format, this AS-path line is NOT clean on its own.
+    """
+    routes = []
+    current = None  # {"prefix": ..., "lines": [all lines incl. line 1's tail]}
+
+    def flush(rec):
+        if rec is None:
+            return
+        next_hop = ""
+        for text_line in rec["lines"]:
+            for token in text_line.split():
+                if IPV6_BARE_IP_TOKEN_RE.match(token) and "/" not in token:
+                    next_hop = token
+                    break
+            if next_hop:
+                break
+        as_path = ""
+        for text_line in reversed(rec["lines"]):
+            if not text_line.strip():
+                continue
+            tokens = text_line.split()
+            if len(tokens) >= 2 and tokens[-1] in ("I", "E", "?", "i", "e"):
+                as_path = " ".join(tokens[-2:])
+            elif tokens:
+                as_path = tokens[-1]
+            break
+        routes.append({"prefix": rec["prefix"], "next_hop": next_hop, "as_path": as_path})
+
+    for line in show_routes_text.splitlines():
+        if re.match(r"^\s*Processed \d+ prefixes", line):
+            continue
+        if not line.strip():
+            continue
+        m = IPV6_CLASSIC_RECORD_START_RE.match(line)
+        if m and "/" in m.group("prefix"):
+            flush(current)
+            current = {"prefix": m.group("prefix"), "lines": [m.group("rest")]}
             continue
         if current is not None:
             current["lines"].append(line)
@@ -926,16 +1009,21 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
         adv_text, rec_text = collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform, use_sample_dir)
         # IOS-XR wraps IPv6 routes across multiple lines (confirmed against
         # real output) - a genuinely different format from IPv4's one-line
-        # table, so it needs its own parser, not just afi passed through to
-        # the same one.
+        # table. Worse, `advertised-routes` and `received routes` use TWO
+        # DIFFERENT wrapped formats from each other on IOS-XR IPv6 (also
+        # confirmed against real output): advertised-routes has a clean
+        # AS-path line, received-routes uses the classic `*>`-marked table
+        # with Metric/LocPrf/Weight mixed into the AS-path line - so each
+        # direction needs its own parser here, not one shared one.
         if platform == "junos":
-            route_parser = parse_junos_routes
+            adv_parser = rec_parser = parse_junos_routes
         elif afi == "ipv6":
-            route_parser = parse_ios_xr_ipv6_routes
+            adv_parser = parse_ios_xr_ipv6_routes
+            rec_parser = parse_ios_xr_ipv6_classic_routes
         else:
-            route_parser = parse_routes
-        adv_routes = route_parser(adv_text)
-        rec_routes = route_parser(rec_text)
+            adv_parser = rec_parser = parse_routes
+        adv_routes = adv_parser(adv_text)
+        rec_routes = rec_parser(rec_text)
         # Same self-diagnosis pattern as the community parser: if a command
         # returned substantial text but 0 routes came out of it, that's a
         # real format mismatch worth seeing immediately, not just "0
