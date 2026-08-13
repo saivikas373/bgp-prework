@@ -676,13 +676,29 @@ def collect_from_device(conn_or_dir, hostname, platform="iosxr", use_sample_dir=
     else:
         conn = conn_or_dir
         if platform == "junos":
-            outputs["summary"] = _run(conn, "show bgp summary")
-            outputs["config_bgp"] = _run(conn, "show configuration protocols bgp")
-            outputs["policy_options"] = _run(conn, "show configuration policy-options")
+            cmds = [("summary", "show bgp summary"),
+                    ("config_bgp", "show configuration protocols bgp"),
+                    ("policy_options", "show configuration policy-options")]
         else:
-            outputs["summary_v4"] = _run(conn, "show bgp ipv4 unicast summary")
-            outputs["summary_v6"] = _run(conn, "show bgp ipv6 unicast summary")
-            outputs["running_bgp"] = _run(conn, "show running-config router bgp")
+            cmds = [("summary_v4", "show bgp ipv4 unicast summary"),
+                    ("summary_v6", "show bgp ipv6 unicast summary"),
+                    ("running_bgp", "show running-config router bgp")]
+        for key, cmd in cmds:
+            try:
+                # A full config/policy dump on a core router with many
+                # neighbor-groups (seen: 20+ on rcr01drhmncev) can be large -
+                # same slow-command risk the route pulls already needed
+                # protection from, so this gets the same delay_factor bump
+                # and recovery-on-failure instead of crashing the whole
+                # device and losing everything collected from it.
+                outputs[key] = _run(conn, cmd, delay_factor=4)
+            except Exception as e:
+                print(f"    ! `{cmd}` failed/timed out ({e}) - treating as empty, "
+                      f"recovering the connection, and continuing. Neighbor "
+                      f"discovery/config context for this device may be incomplete.",
+                      file=sys.stderr)
+                outputs[key] = ""
+                _recover_connection(conn)
     return outputs
 
 
@@ -947,7 +963,12 @@ def main():
                     host=dev["mgmt_ip"], username=username, password=password,
                     port=int(dev.get("port") or 22),
                 )
-                running_bgp = _run(conn, "show running-config router bgp")
+                try:
+                    running_bgp = _run(conn, "show running-config router bgp", delay_factor=4)
+                except Exception as e:
+                    print(f"    ! running-config pull failed/timed out ({e}) - "
+                          f"skipping this device's aggregates.", file=sys.stderr)
+                    running_bgp = ""
                 conn.disconnect()
             for o in parse_bgp_originations(running_bgp):
                 discovered.append({
