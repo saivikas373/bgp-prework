@@ -353,6 +353,65 @@ def parse_routes(show_routes_text):
     return routes
 
 
+IPV6_BARE_PREFIX_RE = re.compile(r"^(?P<prefix>[0-9a-fA-F:]+/\d+)\s*$")
+IPV6_BARE_ADDR_RE = re.compile(r"^(?P<addr>[0-9a-fA-F:]+)\s*$")
+
+
+def parse_ios_xr_ipv6_routes(show_routes_text):
+    """
+    Parses IOS-XR `show bgp ipv6 unicast neighbors <ip> advertised-routes` /
+    `received routes` output -> [{prefix, next_hop, as_path}].
+
+    Unlike IPv4 (one route per line), IOS-XR wraps each IPv6 route across
+    MULTIPLE lines - confirmed against real output - because the addresses
+    are too long for the fixed-width table columns:
+
+        Network            Next Hop        From            AS Path
+        2600:6c7f:9370::/44
+                              2606:a000:0:4::77
+                                           2607:f428:9370:ff::80
+                                                           19115 19115i
+        2600:6c7f:9370:0:2::/80
+                              2606:a000:0:4::77
+                                           2607:f428:9370:ff::87
+                                                           19115i
+
+    Each record: a bare prefix on its own line (no other content), followed
+    by next-hop alone, then "from" alone, then the AS-path line (which may
+    itself have 1+ tokens, e.g. "19115i" or "19115 19115i" for a
+    multi-hop path with a trailing origin code). A new bare-prefix line
+    always starts the next record, so that's what delimits records - the
+    number of continuation lines isn't assumed to be fixed here in case a
+    longer AS-path ever wraps across an extra line.
+    """
+    routes = []
+    current = None  # {"prefix": ..., "lines": [continuation lines]}
+
+    def flush(rec):
+        if rec is None or not rec["lines"]:
+            return
+        next_hop = rec["lines"][0].strip()
+        # The AS-path line is isolated on its own line in this format (no
+        # nexthop/from mixed in like the IPv4 single-line table), so unlike
+        # parse_routes() there's nothing to trim - take it as-is, whether
+        # it's "19115i" or a multi-hop "19115 19115i".
+        as_path = rec["lines"][-1].strip()
+        routes.append({"prefix": rec["prefix"], "next_hop": next_hop, "as_path": as_path})
+
+    for line in show_routes_text.splitlines():
+        if not line.strip():
+            continue
+        m = IPV6_BARE_PREFIX_RE.match(line)
+        if m:
+            flush(current)
+            current = {"prefix": m.group("prefix"), "lines": []}
+            continue
+        if current is not None:
+            current["lines"].append(line)
+    flush(current)
+    return routes
+
+
 def parse_prefix_detail_communities(detail_text):
     """
     Parses `show bgp ipv4/ipv6 unicast <prefix>` output into the community
@@ -848,7 +907,6 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
                neighbor_group_filter=None, platform="iosxr", neighbor_ip_filter=None):
     rows = []
     all_ips = [(ip, "ipv4") for ip in summary_v4_ips] + [(ip, "ipv6") for ip in summary_v6_ips]
-    route_parser = parse_junos_routes if platform == "junos" else parse_routes
 
     for ip, afi in all_ips:
         cfg = neighbor_cfg.get(ip, {})
@@ -866,6 +924,16 @@ def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregat
 
         print(f"  neighbor {ip} ({afi}, group={group or 'unknown'}):", file=sys.stderr)
         adv_text, rec_text = collect_routes_for_neighbor(conn_or_dir, hostname, ip, afi, platform, use_sample_dir)
+        # IOS-XR wraps IPv6 routes across multiple lines (confirmed against
+        # real output) - a genuinely different format from IPv4's one-line
+        # table, so it needs its own parser, not just afi passed through to
+        # the same one.
+        if platform == "junos":
+            route_parser = parse_junos_routes
+        elif afi == "ipv6":
+            route_parser = parse_ios_xr_ipv6_routes
+        else:
+            route_parser = parse_routes
         adv_routes = route_parser(adv_text)
         rec_routes = route_parser(rec_text)
 
