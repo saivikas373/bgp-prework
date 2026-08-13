@@ -610,6 +610,44 @@ JUNOS_ROUTE_LINE_RE = re.compile(
 )
 
 
+JUNOS_BARE_PREFIX_RE = re.compile(r"^\s*(?P<prefix>[0-9a-fA-F:]+/\d+)\s*$")
+JUNOS_MARKER_LINE_RE = re.compile(r"^\s*\*\s*(?P<rest>.*)$")
+
+
+def _merge_junos_wrapped_lines(show_routes_text):
+    """
+    Junos IPv6 output wraps longer prefixes across two lines - confirmed
+    against real output - unlike IPv4 (and short IPv6 prefixes), which fit
+    on one line:
+
+        * 2600:6c7f:9370::/44     2606:a000:0:4::75          19115 19115 I
+          2600:6c7f:9370:0:2::/80
+        *                         2606:a000:0:4::75          19115 I
+
+    A bare prefix-only line followed by a `*`-marked line (nexthop + AS-path,
+    no prefix) belongs together - the prefix from the first line and the
+    nexthop/as-path from the second. Merges those pairs into single lines
+    matching the normal single-line format, so the existing parsing loop
+    below doesn't need to know about wrapping at all.
+    """
+    lines = show_routes_text.splitlines()
+    merged = []
+    pending_prefix = None
+    for line in lines:
+        bare_m = JUNOS_BARE_PREFIX_RE.match(line)
+        if bare_m:
+            pending_prefix = bare_m.group("prefix")
+            continue
+        marker_m = JUNOS_MARKER_LINE_RE.match(line)
+        if marker_m and pending_prefix:
+            merged.append(f"* {pending_prefix} {marker_m.group('rest')}")
+            pending_prefix = None
+            continue
+        pending_prefix = None
+        merged.append(line)
+    return merged
+
+
 def parse_junos_routes(show_routes_text):
     """
     Parses `show route advertising-protocol bgp <ip>` / `show route
@@ -630,9 +668,13 @@ def parse_junos_routes(show_routes_text):
     instead: split the tail into tokens and take the trailing "<asn>
     <origin-code>" (or just "<asn>" if no origin code is present on that
     line) as the AS path, discarding any MED/Lclpref tokens in between.
+
+    IPv6 prefixes that don't fit on one line get wrapped across two -
+    _merge_junos_wrapped_lines() collapses those back into single lines
+    first (confirmed against real output) before this loop runs.
     """
     routes = []
-    for line in show_routes_text.splitlines():
+    for line in _merge_junos_wrapped_lines(show_routes_text):
         m = JUNOS_ROUTE_LINE_RE.match(line)
         if not m:
             continue
