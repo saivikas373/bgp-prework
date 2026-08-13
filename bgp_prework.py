@@ -360,14 +360,24 @@ def parse_prefix_detail_communities(detail_text):
     semicolon-joined string (matching your example sheet's format, e.g.
     "20115:3101;20115:64080").
 
-    The output has one `Path #N:` block per candidate route; only one is
-    marked "best" in its status line (e.g. "valid, external, best,
+    Multi-path output has one `Path #N:` block per candidate route; only one
+    is marked "best" in its status line (e.g. "valid, external, best,
     group-best, multipath"). Falls back to the first path with a Community
     line if no path is explicitly marked best.
+
+    Single-path entries (e.g. a locally-originated `network`/`aggregate-
+    address` route with only one path) may not use "Path #N:" labeling at
+    all - just one straightforward "Community:" line. If no "Path #N:"
+    blocks are found, fall back to the first "Community:" line anywhere in
+    the text rather than returning nothing.
     """
     # re.split() on a zero-width lookahead needs Python 3.7+; the jump
     # server runs 3.6, so slice on match start positions manually instead.
     starts = [m.start() for m in re.finditer(r"^Path #\d+:", detail_text, flags=re.MULTILINE)]
+    if not starts:
+        comm_match = re.search(r"^\s*Community:\s*(.+)$", detail_text, flags=re.MULTILINE)
+        return comm_match.group(1).strip().replace(" ", ";") if comm_match else ""
+
     blocks = [detail_text[start:(starts[i + 1] if i + 1 < len(starts) else len(detail_text))]
               for i, start in enumerate(starts)]
     best_communities = None
@@ -815,7 +825,19 @@ def collect_prefix_communities(conn_or_dir, hostname, prefix, afi, platform="ios
             _recover_connection(conn)
             text = ""
     parser = parse_junos_prefix_communities if platform == "junos" else parse_prefix_detail_communities
-    return parser(text)
+    result = parser(text)
+    if not result and text.strip():
+        # Command succeeded and returned something, but the parser found no
+        # communities in it - most likely a real format variant we haven't
+        # seen yet (e.g. IOS-XR's single-path table entries may not use the
+        # "Path #N:" labeling the multi-path parser looks for). Print a
+        # snippet so this is diagnosable from the same run instead of
+        # needing a separate follow-up just to see the raw output.
+        snippet = "\n".join(text.splitlines()[:12])
+        print(f"    ! no communities found in output for {prefix} (command succeeded, "
+              f"{len(text.splitlines())} lines returned) - raw output snippet:\n"
+              f"------\n{snippet}\n------", file=sys.stderr)
+    return result
 
 
 def build_rows(location, hostname, neighbor_cfg, communities_by_policy, aggregates,
